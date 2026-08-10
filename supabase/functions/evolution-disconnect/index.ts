@@ -19,6 +19,10 @@ Deno.serve(async (req: Request) => {
       method: 'DELETE',
     })
 
+    if (error) {
+      return errorResponse(error, status)
+    }
+
     const db = createServiceClient()
     await db
       .from('user_integrations')
@@ -28,10 +32,6 @@ Deno.serve(async (req: Request) => {
         updated_at: new Date().toISOString(),
       })
       .eq('user_id', user.id)
-
-    if (error) {
-      return errorResponse(error, status)
-    }
 
     return jsonResponse({ success: true, data })
   } catch (err) {

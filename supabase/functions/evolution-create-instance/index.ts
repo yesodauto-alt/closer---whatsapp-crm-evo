@@ -9,11 +9,13 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { user } = await resolveIntegration(req)
+    const { user, integration } = await resolveIntegration(req)
     if (!user) return errorResponse('Unauthorized', 401)
 
-    const body = await req.json().catch(() => ({}))
-    const instanceName = (body?.instanceName as string) || user.id
+    // Resolve the instance name exclusively on the server: reuse the existing
+    // integration's instance when present, otherwise fall back to the user id.
+    // The client can never choose an arbitrary instance name.
+    const instanceName = integration?.instance_name || user.id
 
     // Reuse the instance if it already exists; otherwise create it. Never duplicates.
     const ensured = await ensureInstanceExists(instanceName)
