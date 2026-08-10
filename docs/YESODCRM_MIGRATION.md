@@ -4,7 +4,6 @@
 
 - Origem funcional e visual: `yesodauto-alt/yesodcrm`.
 - Destino operacional: `yesodauto-alt/whatsapp-crm-clone-evo`.
-- Plataforma de continuidade: Skip.
 - Backend de destino: Supabase próprio.
 
 ## Regra principal

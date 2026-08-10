@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js'
+import { resolveEvolutionNumber } from '../_shared/phone.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -57,7 +58,7 @@ Deno.serve(async (request) => {
         throw new Error('Evolution não configurada')
       }
 
-      const number = contact.remote_jid || contact.phone_number
+      const number = resolveEvolutionNumber(contact.remote_jid, contact.phone_number)
       const response = await fetch(
         `${evolutionUrl}/message/sendText/${encodeURIComponent(integration.instance_name)}`,
         {

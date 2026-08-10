@@ -1,7 +1,7 @@
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { corsHeaders } from '../_shared/cors.ts'
 import { evolutionFetch, jsonResponse, errorResponse } from '../_shared/evolution-api.ts'
-import { createClient } from 'npm:@supabase/supabase-js@2'
+import { createServiceClient, resolveIntegration } from '../_shared/integration.ts'
 
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
@@ -9,11 +9,11 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { instanceName, userId } = await req.json()
+    const { user, integration } = await resolveIntegration(req)
+    if (!user || !integration) return errorResponse('Unauthorized', 401)
+    if (!integration.instance_name) return errorResponse('Integration has no instance_name', 400)
 
-    if (!instanceName) {
-      return errorResponse('instanceName is required', 400)
-    }
+    const instanceName = integration.instance_name
 
     const { data, error, status } = await evolutionFetch(`/instance/logout/${instanceName}`, {
       method: 'DELETE',
@@ -23,20 +23,15 @@ Deno.serve(async (req: Request) => {
       return errorResponse(error, status)
     }
 
-    if (userId) {
-      const supabase = createClient(
-        Deno.env.get('SUPABASE_URL')!,
-        Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
-      )
-      await supabase
-        .from('user_integrations')
-        .update({
-          status: 'DISCONNECTED',
-          is_setup_completed: false,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('user_id', userId)
-    }
+    const db = createServiceClient()
+    await db
+      .from('user_integrations')
+      .update({
+        status: 'DISCONNECTED',
+        is_setup_completed: false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('user_id', user.id)
 
     return jsonResponse({ success: true, data })
   } catch (err) {
