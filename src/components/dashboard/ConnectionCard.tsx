@@ -30,9 +30,7 @@ export function ConnectionCard() {
     setLoading(true)
     setError(null)
     try {
-      const { data, error: invokeError } = await supabase.functions.invoke('evolution-get-qr', {
-        body: { integrationId: integration.id },
-      })
+      const { data, error: invokeError } = await supabase.functions.invoke('evolution-get-qr')
 
       if (invokeError) {
         throw new Error(invokeError.message || 'Unknown error calling Edge Function')
@@ -95,17 +93,22 @@ export function ConnectionCard() {
     }
   }, [integration?.status])
 
-  const handleSimulateConnection = async () => {
+  const handleDisconnect = async () => {
     if (!integration?.id) return
     setLoading(true)
-    await supabase
-      .from('user_integrations')
-      .update({ status: 'CONNECTED' })
-      .eq('id', integration.id)
-    setIntegration({ ...integration, status: 'CONNECTED' })
-    setQrCode(null)
-    setLoading(false)
-    toast.success('Simulation: Connected to WhatsApp!')
+    setError(null)
+    try {
+      const { error: invokeError } = await supabase.functions.invoke('evolution-disconnect', {})
+      if (invokeError) throw new Error(invokeError.message || 'Failed to disconnect')
+      setIntegration({ ...integration, status: 'DISCONNECTED' })
+      setQrCode(null)
+      toast.success('Disconnected from WhatsApp')
+    } catch (err: any) {
+      console.error(err)
+      setError(err.message || 'Failed to disconnect')
+    } finally {
+      setLoading(false)
+    }
   }
 
   const handleReset = async () => {
@@ -211,13 +214,6 @@ export function ConnectionCard() {
                     <RefreshCw className={`mr-2 h-3 w-3 ${loading ? 'animate-spin' : ''}`} /> Force
                     Retry
                   </Button>
-                  <Button
-                    variant="link"
-                    onClick={handleSimulateConnection}
-                    className="text-xs text-zinc-400 hover:text-zinc-600"
-                  >
-                    Simulate Connection
-                  </Button>
                 </div>
               </div>
             )}
@@ -259,14 +255,6 @@ export function ConnectionCard() {
                   >
                     <PowerOff className="mr-2 h-3 w-3" /> Restart
                   </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={handleSimulateConnection}
-                    className="text-zinc-400 hover:text-zinc-600 rounded-full"
-                  >
-                    Simulate Scan
-                  </Button>
                 </div>
                 <p className="text-xs text-zinc-500 mt-4 text-center max-w-xs font-medium">
                   Open WhatsApp on your phone, go to Settings &gt; Linked Devices, and scan this
@@ -305,7 +293,7 @@ export function ConnectionCard() {
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={handleReset}
+                  onClick={handleDisconnect}
                   disabled={loading}
                   className="shrink-0 bg-white hover:bg-zinc-100 border-zinc-200 text-zinc-600 rounded-full"
                 >

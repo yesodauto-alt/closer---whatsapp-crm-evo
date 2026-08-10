@@ -34,9 +34,7 @@ export default function Onboarding() {
       const fetchQR = async () => {
         if (!integration?.id) return
         try {
-          const { data } = await supabase.functions.invoke('evolution-get-qr', {
-            body: { integrationId: integration.id },
-          })
+          const { data } = await supabase.functions.invoke('evolution-get-qr')
           if (data?.base64) {
             setQrCode(data.base64)
             if (integration.status !== 'WAITING_QR') {

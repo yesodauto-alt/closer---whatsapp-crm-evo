@@ -36,9 +36,7 @@ export default function Settings() {
     let retries = 0
     const fetchQr = async () => {
       try {
-        const { data, error } = await supabase.functions.invoke('evolution-get-qr', {
-          body: { integrationId: integration.id },
-        })
+        const { data, error } = await supabase.functions.invoke('evolution-get-qr')
 
         if (error) throw error
 
@@ -77,9 +75,7 @@ export default function Settings() {
     if (!integration) return
     setIsConnecting(true)
     try {
-      const { error } = await supabase.functions.invoke('evolution-disconnect', {
-        body: { integrationId: integration.id },
-      })
+      const { error } = await supabase.functions.invoke('evolution-disconnect')
       if (error) throw error
       toast.success(t('disconnected_success'))
       setQrCode(null)

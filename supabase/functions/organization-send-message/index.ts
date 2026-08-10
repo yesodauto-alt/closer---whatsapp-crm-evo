@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js'
+import { resolveEvolutionNumber } from '../_shared/phone.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -75,7 +76,7 @@ Deno.serve(async (request) => {
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', apikey: evolutionKey },
-      body: JSON.stringify({ number: contact.remote_jid || contact.phone_number, text }),
+      body: JSON.stringify({ number: resolveEvolutionNumber(contact.remote_jid, contact.phone_number), text }),
     },
   )
   const payload = await response.json().catch(() => ({}))

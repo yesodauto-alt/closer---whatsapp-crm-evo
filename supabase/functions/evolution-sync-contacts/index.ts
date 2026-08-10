@@ -1,16 +1,8 @@
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { corsHeaders } from '../_shared/cors.ts'
 import { evolutionFetch, jsonResponse, errorResponse } from '../_shared/evolution-api.ts'
-import { createClient } from 'npm:@supabase/supabase-js@2'
-
-interface EvolutionContact {
-  id?: string
-  pushName?: string
-  profilePictureUrl?: string
-  number?: string
-  jid?: string
-  name?: string
-}
+import { createServiceClient, resolveIntegration } from '../_shared/integration.ts'
+import { normalizeBrazilianPhone, digitsFromJid } from '../_shared/phone.ts'
 
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
@@ -18,11 +10,11 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { instanceName, userId } = await req.json()
+    const { user, integration } = await resolveIntegration(req)
+    if (!user || !integration) return errorResponse('Unauthorized', 401)
+    if (!integration.instance_name) return errorResponse('Integration has no instance_name', 400)
 
-    if (!instanceName || !userId) {
-      return errorResponse('instanceName and userId are required', 400)
-    }
+    const instanceName = integration.instance_name
 
     const { data, error, status } = await evolutionFetch(`/chat/whatsappNumbers/${instanceName}`, {
       method: 'GET',
@@ -32,30 +24,30 @@ Deno.serve(async (req: Request) => {
       return errorResponse(error, status)
     }
 
-    const supabase = createClient(
-      Deno.env.get('SUPABASE_URL')!,
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
-    )
-
-    const contacts: EvolutionContact[] = Array.isArray(data) ? data : (data?.contacts ?? [])
+    const contacts: any[] = Array.isArray(data) ? data : (data?.contacts ?? [])
+    const db = createServiceClient()
     let synced = 0
 
     for (const contact of contacts) {
       const remoteJid = contact.jid || contact.id || ''
-      const phoneNumber = contact.number || remoteJid.split('@')[0] || ''
-
       if (!remoteJid) continue
 
-      const { error: upsertError } = await supabase.from('whatsapp_contacts').upsert(
-        {
-          user_id: userId,
-          remote_jid: remoteJid,
-          push_name: contact.pushName || contact.name || null,
-          profile_picture_url: contact.profilePictureUrl || null,
-          phone_number: phoneNumber || null,
-        },
-        { onConflict: 'user_id,remote_jid' },
-      )
+      // Derive canonical phone_number from the raw number or the JID.
+      const rawNumber = contact.number || ''
+      const canonicalPhone = normalizeBrazilianPhone(rawNumber) || digitsFromJid(remoteJid)
+
+      const { error: upsertError } = await db
+        .from('whatsapp_contacts')
+        .upsert(
+          {
+            user_id: user.id,
+            remote_jid: remoteJid,
+            push_name: contact.pushName || contact.name || null,
+            profile_picture_url: contact.profilePictureUrl || null,
+            phone_number: canonicalPhone || null,
+          },
+          { onConflict: 'user_id,remote_jid' },
+        )
 
       if (!upsertError) synced++
     }

@@ -2,6 +2,7 @@ import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { corsHeaders } from '../_shared/cors.ts'
 import { jsonResponse } from '../_shared/evolution-api.ts'
 import { createClient } from 'npm:@supabase/supabase-js@2'
+import { digitsFromJid } from '../_shared/phone.ts'
 import { handleMessageUpsert } from './ai-handler.ts'
 
 const supabase = createClient(
@@ -50,7 +51,7 @@ async function handleMessagesUpsert(event: any, instance: string) {
           user_id: userId,
           remote_jid: remoteJid,
           push_name: msg?.pushName || null,
-          phone_number: remoteJid.split('@')[0] || null,
+          phone_number: digitsFromJid(remoteJid) || null,
           last_message_at: new Date().toISOString(),
         })
         .select()
@@ -79,7 +80,7 @@ async function handleMessagesUpsert(event: any, instance: string) {
         timestamp,
         raw: msg,
       },
-      { onConflict: 'message_id' },
+      { onConflict: 'user_id,message_id' },
     )
 
     if (!fromMe && contact && text) {

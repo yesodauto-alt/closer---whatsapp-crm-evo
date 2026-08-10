@@ -1,12 +1,7 @@
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { corsHeaders } from '../_shared/cors.ts'
-import {
-  evolutionFetch,
-  jsonResponse,
-  errorResponse,
-  getEvolutionConfig,
-} from '../_shared/evolution-api.ts'
-import { createClient } from 'npm:@supabase/supabase-js@2'
+import { jsonResponse, errorResponse } from '../_shared/evolution-api.ts'
+import { createServiceClient, resolveIntegration, ensureInstanceExists } from '../_shared/integration.ts'
 
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
@@ -14,61 +9,39 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { instanceName, userId } = await req.json()
+    const { user } = await resolveIntegration(req)
+    if (!user) return errorResponse('Unauthorized', 401)
 
-    if (!instanceName || !userId) {
-      return errorResponse('instanceName and userId are required', 400)
+    const body = await req.json().catch(() => ({}))
+    const instanceName = (body?.instanceName as string) || user.id
+
+    // Reuse the instance if it already exists; otherwise create it. Never duplicates.
+    const ensured = await ensureInstanceExists(instanceName)
+    if (ensured.error) {
+      return errorResponse(ensured.error, ensured.status)
     }
 
-    const { data, error, status } = await evolutionFetch('/instance/create', {
-      method: 'POST',
-      body: {
-        instanceName,
-        qrcode: true,
-        integration: 'WHATSAPP-BAILEYS',
-      },
-    })
-
-    if (error) {
-      return errorResponse(error, status)
-    }
-
-    const config = getEvolutionConfig()
-    const supabase = createClient(
-      Deno.env.get('SUPABASE_URL')!,
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
-    )
-
-    const { data: existing } = await supabase
+    const db = createServiceClient()
+    const { data: existing } = await db
       .from('user_integrations')
       .select('id')
-      .eq('user_id', userId)
+      .eq('user_id', user.id)
       .maybeSingle()
 
-    if (existing) {
-      await supabase
-        .from('user_integrations')
-        .update({
-          instance_name: instanceName,
-          evolution_api_url: config.baseUrl,
-          evolution_api_key: config.apiKey,
-          status: 'CONNECTING',
-          is_setup_completed: true,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', existing.id)
-    } else {
-      await supabase.from('user_integrations').insert({
-        user_id: userId,
-        instance_name: instanceName,
-        evolution_api_url: config.baseUrl,
-        evolution_api_key: config.apiKey,
-        status: 'CONNECTING',
-        is_setup_completed: true,
-      })
+    const patch = {
+      instance_name: instanceName,
+      status: 'CONNECTING',
+      is_setup_completed: true,
+      updated_at: new Date().toISOString(),
     }
 
-    return jsonResponse({ success: true, data })
+    if (existing) {
+      await db.from('user_integrations').update(patch).eq('id', existing.id)
+    } else {
+      await db.from('user_integrations').insert({ user_id: user.id, ...patch })
+    }
+
+    return jsonResponse({ success: true, created: ensured.created, data: ensured.data })
   } catch (err) {
     return errorResponse(err.message || 'Internal server error', 500)
   }
