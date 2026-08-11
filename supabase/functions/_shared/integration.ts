@@ -29,14 +29,35 @@ export async function getAuthUser(req: Request) {
   const anonKey = Deno.env.get('SUPABASE_ANON_KEY')
   if (!url || !anonKey) throw new Error('SUPABASE_URL and SUPABASE_ANON_KEY must be set')
 
+  const authHeader = req.headers.get('Authorization') ?? req.headers.get('authorization') ?? ''
+  const match = authHeader.match(/^Bearer\s+(.+)$/i)
+  const token = match?.[1]?.trim() ?? ''
+
+  if (!token || token.startsWith('sb_')) {
+    console.error('[auth] Missing user access token in Authorization header')
+    return null
+  }
+
   const client = createClient(url, anonKey, {
-    global: { headers: { authorization: req.headers.get('Authorization') ?? '' } },
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
   })
+
   const {
     data: { user },
     error,
-  } = await client.auth.getUser()
-  if (error || !user) return null
+  } = await client.auth.getUser(token)
+
+  if (error || !user) {
+    console.error('[auth] Failed to resolve user from access token', {
+      error: error?.message ?? 'No user returned',
+    })
+    return null
+  }
+
   return user
 }
 
