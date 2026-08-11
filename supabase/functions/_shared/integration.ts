@@ -24,7 +24,6 @@ export function createServiceClient() {
   return createClient(url, key)
 }
 
-// Resolve the caller's Supabase user from the JWT in the Authorization header.
 export async function getAuthUser(req: Request) {
   const url = Deno.env.get('SUPABASE_URL')
   const anonKey = Deno.env.get('SUPABASE_ANON_KEY')
@@ -41,6 +40,35 @@ export async function getAuthUser(req: Request) {
   return user
 }
 
+export async function resolveTenant(userId: string) {
+  const db = createServiceClient()
+  const { data: membership, error: membershipError } = await db
+    .from('organization_members')
+    .select('organization_id')
+    .eq('user_id', userId)
+    .eq('is_active', true)
+    .limit(1)
+    .maybeSingle()
+
+  if (membershipError) throw new Error(membershipError.message)
+  if (!membership?.organization_id) {
+    return { organizationId: null, tenantUserId: userId }
+  }
+
+  const { data: organization, error: organizationError } = await db
+    .from('organizations')
+    .select('owner_user_id')
+    .eq('id', membership.organization_id)
+    .maybeSingle()
+
+  if (organizationError) throw new Error(organizationError.message)
+
+  return {
+    organizationId: membership.organization_id as string,
+    tenantUserId: (organization?.owner_user_id as string | undefined) ?? userId,
+  }
+}
+
 export async function getIntegrationByUserId(userId: string) {
   const db = createServiceClient()
   const { data, error } = await db
@@ -52,16 +80,17 @@ export async function getIntegrationByUserId(userId: string) {
   return data
 }
 
-// Resolve the authenticated user and their integration in one call.
 export async function resolveIntegration(req: Request) {
   const user = await getAuthUser(req)
-  if (!user) return { user: null, integration: null }
-  const integration = await getIntegrationByUserId(user.id)
-  return { user, integration }
+  if (!user) {
+    return { user: null, integration: null, tenantUserId: null, organizationId: null }
+  }
+
+  const { tenantUserId, organizationId } = await resolveTenant(user.id)
+  const integration = await getIntegrationByUserId(tenantUserId)
+  return { user, integration, tenantUserId, organizationId }
 }
 
-// Ensure the Evolution instance exists on the server, reusing it when present and
-// creating it otherwise. Never creates a duplicate.
 export async function ensureInstanceExists(
   instanceName: string,
 ): Promise<{ created: boolean; data: unknown; status: number; error: string | null }> {
@@ -82,9 +111,7 @@ export async function ensureInstanceExists(
       : []
   const exists = instances.some((i: any) => (i?.instanceName ?? i?.name) === instanceName)
 
-  if (exists) {
-    return { created: false, data: { exists: true }, status: 200, error: null }
-  }
+  if (exists) return { created: false, data: { exists: true }, status: 200, error: null }
 
   const create = await evolutionFetch('/instance/create', {
     method: 'POST',
