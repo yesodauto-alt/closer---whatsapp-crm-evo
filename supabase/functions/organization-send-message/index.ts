@@ -60,23 +60,25 @@ Deno.serve(async (request) => {
   const text = String(body.text || '').trim()
   if (!contactId || !text) return json(request, { error: 'contactId e text são obrigatórios' }, 400)
 
-  // This RLS-scoped read both authorizes the current user and returns the contact data,
-  // avoiding a second round-trip for the same record.
   const contactStart = performance.now()
   const { data: contact, error: contactError } = await userDb
     .from('whatsapp_contacts')
-    .select('id, user_id, remote_jid, phone_number')
+    .select('id, user_id, integration_id, remote_jid, phone_number')
     .eq('id', contactId)
     .single()
   const contactMs = elapsed(contactStart)
   if (contactError || !contact) return json(request, { error: 'Contato não autorizado' }, 403)
 
   const integrationStart = performance.now()
-  const { data: integration, error: integrationError } = await adminDb
+  let integrationQuery = adminDb
     .from('user_integrations')
-    .select('evolution_api_url, evolution_api_key, instance_name')
-    .eq('user_id', contact.user_id)
-    .single()
+    .select('id, evolution_api_url, evolution_api_key, instance_name')
+
+  integrationQuery = contact.integration_id
+    ? integrationQuery.eq('id', contact.integration_id)
+    : integrationQuery.eq('user_id', contact.user_id).eq('is_primary', true)
+
+  const { data: integration, error: integrationError } = await integrationQuery.limit(1).maybeSingle()
   const integrationMs = elapsed(integrationStart)
   if (integrationError || !integration) return json(request, { error: 'Integração não encontrada' }, 404)
 
@@ -105,6 +107,7 @@ Deno.serve(async (request) => {
     const evolutionMs = elapsed(evolutionStart)
     const message = error instanceof Error ? error.message : 'Falha de conexão com Evolution API'
     console.error('[send-message] Evolution connection failed', {
+      integrationId: integration.id,
       authMs,
       contactMs,
       integrationMs,
@@ -127,6 +130,7 @@ Deno.serve(async (request) => {
     const evolutionError =
       payload?.message || payload?.error || payload?.response?.message || `Evolution HTTP ${response.status}`
     console.error('[send-message] Evolution rejected message', {
+      integrationId: integration.id,
       status: response.status,
       authMs,
       contactMs,
@@ -145,6 +149,7 @@ Deno.serve(async (request) => {
     adminDb.from('whatsapp_messages').upsert(
       {
         user_id: contact.user_id,
+        integration_id: integration.id,
         contact_id: contact.id,
         message_id: messageId,
         from_me: true,
@@ -153,7 +158,7 @@ Deno.serve(async (request) => {
         timestamp,
         raw: payload,
       },
-      { onConflict: 'user_id,message_id' },
+      { onConflict: 'integration_id,message_id' },
     ),
     adminDb.from('whatsapp_contacts').update({ last_message_at: timestamp }).eq('id', contact.id),
   ])
@@ -168,6 +173,7 @@ Deno.serve(async (request) => {
 
   const totalMs = elapsed(startedAt)
   console.log('[send-message] timing', {
+    integrationId: integration.id,
     authMs,
     contactMs,
     integrationMs,
@@ -179,6 +185,7 @@ Deno.serve(async (request) => {
   return json(request, {
     success: true,
     messageId,
+    integrationId: integration.id,
     timing: { authMs, contactMs, integrationMs, evolutionMs, persistMs, totalMs },
   })
 })

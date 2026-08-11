@@ -20,7 +20,11 @@ export const useIntegration = () => {
 
 export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
   const { user } = useAuth()
-  const { tenantUserId, loading: organizationLoading } = useOrganization()
+  const {
+    tenantUserId,
+    organizationId,
+    loading: organizationLoading,
+  } = useOrganization()
   const [integration, setIntegration] = useState<UserIntegration | null>(null)
   const [loading, setLoading] = useState(true)
   const contactSyncAttemptedRef = useRef<string | null>(null)
@@ -44,20 +48,47 @@ export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
         .from('user_integrations')
         .select('*')
         .eq('user_id', tenantUserId)
+        .order('is_primary', { ascending: false })
+        .order('created_at', { ascending: true })
+        .limit(1)
         .maybeSingle()
 
       if (error) {
-        console.error('[useIntegration] Failed to load tenant integration:', error)
+        console.error('[useIntegration] Failed to load primary tenant integration:', error)
         setIntegration(null)
         setLoading(false)
         return
       }
 
-      if (!data) {
+      if (!data && organizationId) {
+        const { data: channel, error: channelError } = await supabase
+          .from('channels')
+          .insert({
+            organization_id: organizationId,
+            name: 'WhatsApp principal',
+            type: 'whatsapp',
+            provider: 'evolution',
+            status: 'DISCONNECTED',
+            is_active: true,
+            created_by: user.id,
+          } as any)
+          .select()
+          .single()
+
+        if (channelError || !channel) {
+          console.error('[useIntegration] Failed to create primary channel:', channelError)
+          setIntegration(null)
+          setLoading(false)
+          return
+        }
+
         const newIntegration = {
           user_id: tenantUserId,
+          channel_id: channel.id,
+          provider: 'evolution',
           instance_name: tenantUserId,
           status: 'DISCONNECTED',
+          is_primary: true,
           is_setup_completed: false,
           is_webhook_enabled: false,
         }
@@ -69,12 +100,12 @@ export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
           .single()
 
         if (insertError) {
-          console.error('[useIntegration] Failed to create tenant integration:', insertError)
+          console.error('[useIntegration] Failed to create primary tenant integration:', insertError)
           setIntegration(null)
         } else if (inserted) {
           setIntegration(inserted as UserIntegration)
         }
-      } else if (!data.instance_name) {
+      } else if (data && !data.instance_name) {
         const { data: updated, error: updateError } = await supabase
           .from('user_integrations')
           .update({ instance_name: tenantUserId } as any)
@@ -83,13 +114,13 @@ export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
           .single()
 
         if (updateError) {
-          console.error('[useIntegration] Failed to repair tenant instance name:', updateError)
+          console.error('[useIntegration] Failed to repair primary instance name:', updateError)
           setIntegration(data as UserIntegration)
         } else if (updated) {
           setIntegration(updated as UserIntegration)
         }
       } else {
-        setIntegration(data as UserIntegration)
+        setIntegration((data as UserIntegration) ?? null)
       }
 
       setLoading(false)
@@ -107,16 +138,10 @@ export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
           table: 'user_integrations',
           filter: `user_id=eq.${tenantUserId}`,
         },
-        (payload) => {
-          if (payload.eventType === 'DELETE') {
-            setIntegration(null)
-            contactSyncAttemptedRef.current = null
-            return
-          }
-          setIntegration((prev) => ({
-            ...(prev || {}),
-            ...(payload.new as UserIntegration),
-          }))
+        () => {
+          // Multiple channels can now change independently. Always reselect the
+          // tenant's primary integration instead of merging an arbitrary row.
+          fetchIntegration()
         },
       )
       .subscribe()
@@ -124,7 +149,7 @@ export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [user, tenantUserId, organizationLoading])
+  }, [user, tenantUserId, organizationId, organizationLoading])
 
   useEffect(() => {
     if (!integration?.id || integration.status !== 'CONNECTED') return
@@ -132,7 +157,9 @@ export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
 
     contactSyncAttemptedRef.current = integration.id
 
-    void supabase.functions.invoke('evolution-sync-contacts').then(({ data, error }) => {
+    void supabase.functions.invoke('evolution-sync-contacts', {
+      body: { integrationId: integration.id },
+    }).then(({ data, error }) => {
       if (error || data?.error) {
         console.error(
           '[useIntegration] Automatic Evolution contact sync failed:',
@@ -144,7 +171,6 @@ export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
       console.info('[useIntegration] Evolution contacts synchronized:', {
         synced: data?.synced ?? 0,
         total: data?.total ?? 0,
-        webhookConfigured: data?.webhookConfigured ?? false,
       })
     })
   }, [integration?.id, integration?.status])

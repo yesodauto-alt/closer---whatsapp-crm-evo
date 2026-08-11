@@ -7,8 +7,12 @@ Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
-    const { user, integration } = await resolveIntegration(req)
-    if (!user || !integration) return errorResponse('Unauthorized', 401)
+    const body = await req.json().catch(() => ({}))
+    const integrationId = String(body?.integrationId ?? '').trim() || null
+    const channelId = String(body?.channelId ?? '').trim() || null
+
+    const { user, integration } = await resolveIntegration(req, { integrationId, channelId })
+    if (!user || !integration) return errorResponse('Unauthorized or integration not found', 401)
     if (!integration.instance_name) return errorResponse('Integration has no instance_name', 400)
 
     const instanceName = integration.instance_name
@@ -20,16 +24,29 @@ Deno.serve(async (req: Request) => {
     if (error) return errorResponse(error, status)
 
     const db = createServiceClient()
+    const now = new Date().toISOString()
     await db
       .from('user_integrations')
       .update({
         status: 'DISCONNECTED',
         is_setup_completed: false,
-        updated_at: new Date().toISOString(),
+        updated_at: now,
       })
       .eq('id', integration.id)
 
-    return jsonResponse({ success: true, data })
+    if (integration.channel_id) {
+      await db
+        .from('channels')
+        .update({ status: 'DISCONNECTED', updated_at: now })
+        .eq('id', integration.channel_id)
+    }
+
+    return jsonResponse({
+      success: true,
+      integrationId: integration.id,
+      channelId: integration.channel_id,
+      data,
+    })
   } catch (err) {
     return errorResponse(err instanceof Error ? err.message : 'Internal server error', 500)
   }

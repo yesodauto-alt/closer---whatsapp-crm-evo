@@ -13,6 +13,12 @@ const supabase = createClient(
   Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
 )
 
+type IntegrationContext = {
+  id: string
+  user_id: string
+  channel_id: string | null
+}
+
 function normalizeEventName(value: unknown) {
   return String(value ?? '')
     .trim()
@@ -94,12 +100,31 @@ function cachedContact(cache: Map<string, any>, identity: WhatsAppIdentity) {
   return null
 }
 
-async function findContactByIdentity(userId: string, identity: WhatsAppIdentity) {
+async function findIntegrationByInstance(instanceName: string): Promise<IntegrationContext | null> {
+  const { data, error } = await supabase
+    .from('user_integrations')
+    .select('id, user_id, channel_id')
+    .eq('instance_name', instanceName)
+    .maybeSingle()
+  if (error) {
+    console.error('[evolution-webhook] integration lookup failed', {
+      instanceName,
+      error: error.message,
+    })
+    return null
+  }
+  return data as IntegrationContext | null
+}
+
+async function findContactByIdentity(
+  integration: IntegrationContext,
+  identity: WhatsAppIdentity,
+) {
   if (identity.remoteJid) {
     const { data } = await supabase
       .from('whatsapp_contacts')
       .select('*')
-      .eq('user_id', userId)
+      .eq('integration_id', integration.id)
       .eq('remote_jid', identity.remoteJid)
       .maybeSingle()
     if (data) return data
@@ -109,7 +134,7 @@ async function findContactByIdentity(userId: string, identity: WhatsAppIdentity)
     const { data: byLid } = await supabase
       .from('whatsapp_contacts')
       .select('*')
-      .eq('user_id', userId)
+      .eq('integration_id', integration.id)
       .eq('lid_jid', identity.lidJid)
       .maybeSingle()
     if (byLid) return byLid
@@ -117,7 +142,7 @@ async function findContactByIdentity(userId: string, identity: WhatsAppIdentity)
     const { data: legacyLid } = await supabase
       .from('whatsapp_contacts')
       .select('*')
-      .eq('user_id', userId)
+      .eq('integration_id', integration.id)
       .eq('remote_jid', identity.lidJid)
       .maybeSingle()
     if (legacyLid) return legacyLid
@@ -127,7 +152,7 @@ async function findContactByIdentity(userId: string, identity: WhatsAppIdentity)
     const { data } = await supabase
       .from('whatsapp_contacts')
       .select('*')
-      .eq('user_id', userId)
+      .eq('integration_id', integration.id)
       .eq('phone_number', identity.phoneNumber)
       .maybeSingle()
     if (data) return data
@@ -136,16 +161,7 @@ async function findContactByIdentity(userId: string, identity: WhatsAppIdentity)
   return null
 }
 
-async function findUserIdByInstance(instanceName: string): Promise<string | null> {
-  const { data } = await supabase
-    .from('user_integrations')
-    .select('user_id')
-    .eq('instance_name', instanceName)
-    .maybeSingle()
-  return data?.user_id ?? null
-}
-
-async function upsertContact(userId: string, contact: any) {
+async function upsertContact(integration: IntegrationContext, contact: any) {
   const primaryJid = String(
     contact?.id ||
       contact?.jid ||
@@ -171,9 +187,10 @@ async function upsertContact(userId: string, contact: any) {
 
   if (!identity.remoteJid || !isDirectJid(identity.remoteJid)) return null
 
-  const existing = await findContactByIdentity(userId, identity)
+  const existing = await findContactByIdentity(integration, identity)
   const row: Record<string, unknown> = {
-    user_id: userId,
+    user_id: integration.user_id,
+    integration_id: integration.id,
     remote_jid: identity.remoteJid,
     lid_jid: identity.lidJid,
     phone_number: identity.phoneNumber,
@@ -202,6 +219,7 @@ async function upsertContact(userId: string, contact: any) {
   const { data, error } = await query.select().single()
   if (error) {
     console.error('[evolution-webhook] contact upsert failed', {
+      integrationId: integration.id,
       primaryJid,
       alternateJid,
       canonicalJid: identity.remoteJid,
@@ -213,22 +231,27 @@ async function upsertContact(userId: string, contact: any) {
 }
 
 async function handleContactLikeSet(event: any, instance: string, keys: string[]) {
-  const userId = await findUserIdByInstance(instance)
-  if (!userId) return { processed: 0, reason: 'integration_not_found' }
+  const integration = await findIntegrationByInstance(instance)
+  if (!integration) return { processed: 0, reason: 'integration_not_found' }
 
   const items = extractItems(event?.data, keys)
   let processed = 0
 
-  // Full-history contact/chat sets can be large. Use bounded concurrency instead
-  // of serial network round-trips, but keep it low enough to protect Postgres.
   for (let i = 0; i < items.length; i += 10) {
     const results = await Promise.all(
-      items.slice(i, i + 10).map((item: any) => upsertContact(userId, item)),
+      items.slice(i, i + 10).map((item: any) => upsertContact(integration, item)),
     )
     processed += results.filter(Boolean).length
   }
 
-  return { processed }
+  if (integration.channel_id) {
+    await supabase
+      .from('channels')
+      .update({ last_sync_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq('id', integration.channel_id)
+  }
+
+  return { processed, integrationId: integration.id, channelId: integration.channel_id }
 }
 
 async function upsertMessageRows(rows: any[]) {
@@ -239,7 +262,7 @@ async function upsertMessageRows(rows: any[]) {
     const chunk = rows.slice(i, i + 250)
     const { error } = await supabase
       .from('whatsapp_messages')
-      .upsert(chunk, { onConflict: 'user_id,message_id' })
+      .upsert(chunk, { onConflict: 'integration_id,message_id' })
 
     if (!error) {
       processed += chunk.length
@@ -251,11 +274,10 @@ async function upsertMessageRows(rows: any[]) {
       error: error.message,
     })
 
-    // A single malformed historical record must not discard the rest of the batch.
     for (const row of chunk) {
       const { error: rowError } = await supabase
         .from('whatsapp_messages')
-        .upsert(row, { onConflict: 'user_id,message_id' })
+        .upsert(row, { onConflict: 'integration_id,message_id' })
       if (rowError) errors.push(`${row.message_id}: ${rowError.message}`)
       else processed++
     }
@@ -265,8 +287,8 @@ async function upsertMessageRows(rows: any[]) {
 }
 
 async function handleMessages(event: any, instance: string, triggerAi: boolean) {
-  const userId = await findUserIdByInstance(instance)
-  if (!userId) return { processed: 0, reason: 'integration_not_found' }
+  const integration = await findIntegrationByInstance(instance)
+  if (!integration) return { processed: 0, reason: 'integration_not_found' }
 
   const messages = extractItems(event?.data, ['messages', 'records'])
   const contactCache = new Map<string, any>()
@@ -287,19 +309,15 @@ async function handleMessages(event: any, instance: string, triggerAi: boolean) 
 
     const identity = resolveWhatsAppIdentity(primaryJid, alternateJid)
     let contact = cachedContact(contactCache, identity)
-    if (!contact) {
-      contact = await findContactByIdentity(userId, identity)
-    }
+    if (!contact) contact = await findContactByIdentity(integration, identity)
 
     if (!contact) {
-      contact = await upsertContact(userId, {
+      contact = await upsertContact(integration, {
         id: primaryJid,
         remoteJidAlt: alternateJid,
         pushName: msg?.pushName,
       })
     } else {
-      // Promote a LID-only historical record as soon as Baileys supplies the
-      // alternate phone JID. This preserves one CRM contact across both IDs.
       const updates: Record<string, unknown> = {}
       if (identity.phoneNumber && !contact.phone_number) updates.phone_number = identity.phoneNumber
       if (identity.lidJid && !contact.lid_jid) updates.lid_jid = identity.lidJid
@@ -307,7 +325,7 @@ async function handleMessages(event: any, instance: string, triggerAi: boolean) 
         const { data: collision } = await supabase
           .from('whatsapp_contacts')
           .select('id')
-          .eq('user_id', userId)
+          .eq('integration_id', integration.id)
           .eq('remote_jid', identity.remoteJid)
           .neq('id', contact.id)
           .maybeSingle()
@@ -335,7 +353,8 @@ async function handleMessages(event: any, instance: string, triggerAi: boolean) 
     const text = messageText(msg)
 
     rows.push({
-      user_id: userId,
+      user_id: integration.user_id,
+      integration_id: integration.id,
       contact_id: contact.id,
       message_id: messageId,
       from_me: fromMe,
@@ -354,8 +373,6 @@ async function handleMessages(event: any, instance: string, triggerAi: boolean) 
       })
     }
 
-    // Historical MESSAGES_SET data must never trigger bots/AI. It represents old
-    // traffic being restored into the CRM, not a new inbound customer message.
     if (triggerAi && !fromMe && text) {
       aiCandidates.push({ contact, text })
     }
@@ -373,34 +390,62 @@ async function handleMessages(event: any, instance: string, triggerAi: boolean) 
       .eq('id', contactId)
   }
 
+  if (integration.channel_id) {
+    await supabase
+      .from('channels')
+      .update({ last_sync_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq('id', integration.channel_id)
+  }
+
   if (triggerAi) {
     for (const candidate of aiCandidates) {
-      await handleMessageUpsert(supabase, userId, candidate.contact, candidate.text, instance)
+      await handleMessageUpsert(
+        supabase,
+        integration.user_id,
+        candidate.contact,
+        candidate.text,
+        instance,
+      )
     }
   }
 
   return {
     processed: saved.processed,
     skipped,
+    integrationId: integration.id,
+    channelId: integration.channel_id,
     errors: saved.errors.slice(0, 20),
   }
 }
 
 async function handleConnectionUpdate(event: any, instance: string) {
-  const userId = await findUserIdByInstance(instance)
-  if (!userId) return { processed: 0, reason: 'integration_not_found' }
+  const integration = await findIntegrationByInstance(instance)
+  if (!integration) return { processed: 0, reason: 'integration_not_found' }
 
   const state = event?.data?.state ?? event?.data?.status ?? event?.data?.instance?.state
   let status = 'CONNECTING'
   if (state === 'open' || state === 'CONNECTED') status = 'CONNECTED'
   else if (state === 'close' || state === 'closed' || state === 'DISCONNECTED') status = 'DISCONNECTED'
 
+  const now = new Date().toISOString()
   await supabase
     .from('user_integrations')
-    .update({ status, is_webhook_enabled: true, updated_at: new Date().toISOString() })
-    .eq('instance_name', instance)
+    .update({ status, is_webhook_enabled: true, updated_at: now })
+    .eq('id', integration.id)
 
-  return { processed: 1, status }
+  if (integration.channel_id) {
+    await supabase
+      .from('channels')
+      .update({ status, updated_at: now })
+      .eq('id', integration.channel_id)
+  }
+
+  return {
+    processed: 1,
+    status,
+    integrationId: integration.id,
+    channelId: integration.channel_id,
+  }
 }
 
 Deno.serve(async (req: Request) => {
