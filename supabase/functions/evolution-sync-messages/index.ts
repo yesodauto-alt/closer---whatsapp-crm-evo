@@ -51,19 +51,17 @@ function cleanPushName(value: unknown, identity: WhatsAppIdentity): string | nul
     name === identity.phoneNumber ||
     name === '0' ||
     name.toLowerCase() === 'você'
-  ) {
-    return null
-  }
+  ) return null
   return name
 }
 
 function extractMessages(data: any): any[] {
   if (Array.isArray(data)) return data
-  if (Array.isArray(data?.messages)) return data.messages
   if (Array.isArray(data?.messages?.records)) return data.messages.records
+  if (Array.isArray(data?.messages)) return data.messages
   if (Array.isArray(data?.records)) return data.records
-  if (Array.isArray(data?.data)) return data.data
   if (Array.isArray(data?.data?.messages?.records)) return data.data.messages.records
+  if (Array.isArray(data?.data)) return data.data
   return []
 }
 
@@ -99,6 +97,7 @@ Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
+    const startedAt = performance.now()
     const { user, integration, tenantUserId } = await resolveIntegration(req)
     if (!user || !integration || !tenantUserId) return errorResponse('Unauthorized', 401)
     if (!integration.instance_name) return errorResponse('Integration has no instance_name', 400)
@@ -106,7 +105,7 @@ Deno.serve(async (req: Request) => {
     const instanceName = integration.instance_name
     const body = await req.json().catch(() => ({}))
     const requestedJid = String(body?.remoteJid ?? '').trim()
-    const limit = Math.min(Math.max(Number(body?.limit) || 100, 1), 300)
+    const limit = Math.min(Math.max(Number(body?.limit) || 100, 1), 100)
 
     const targets: TargetChat[] = []
     let rejectedInternalIds = 0
@@ -185,40 +184,41 @@ Deno.serve(async (req: Request) => {
     let synced = 0
     let conversations = 0
     let createdContacts = 0
+    let resolvedPhones = 0
     const errors: Array<{ remoteJid: string; error: string }> = []
 
     for (const target of targets) {
-      const identity = target.identity
+      let identity = target.identity
       let contact =
         byRemote.get(identity.remoteJid) ||
         (identity.lidJid ? byLid.get(identity.lidJid) || byRemote.get(identity.lidJid) : null) ||
         (identity.phoneNumber ? byPhone.get(identity.phoneNumber) : null)
 
-      const contactPatch: Record<string, unknown> = {
+      const basePatch: Record<string, unknown> = {
         user_id: tenantUserId,
         remote_jid: identity.remoteJid,
         lid_jid: identity.lidJid,
         phone_number: identity.phoneNumber,
       }
-      if (target.pushName !== undefined) contactPatch.push_name = target.pushName
+      if (target.pushName !== undefined) basePatch.push_name = target.pushName
       if (target.profilePictureUrl !== undefined) {
-        contactPatch.profile_picture_url = target.profilePictureUrl || null
+        basePatch.profile_picture_url = target.profilePictureUrl || null
       }
 
       if (contact) {
         const { error: updateError } = await db
           .from('whatsapp_contacts')
-          .update(contactPatch)
+          .update(basePatch)
           .eq('id', contact.id)
         if (updateError) {
           errors.push({ remoteJid: target.queryJid, error: updateError.message })
           continue
         }
-        contact = { ...contact, ...contactPatch }
+        contact = { ...contact, ...basePatch }
       } else {
         const { data: created, error: createError } = await db
           .from('whatsapp_contacts')
-          .insert(contactPatch)
+          .insert(basePatch)
           .select()
           .single()
         if (createError) {
@@ -228,8 +228,8 @@ Deno.serve(async (req: Request) => {
         contact = created
         createdContacts++
       }
-
       if (!contact) continue
+
       byRemote.set(identity.remoteJid, contact)
       if (identity.lidJid) byLid.set(identity.lidJid, contact)
       if (identity.phoneNumber) byPhone.set(identity.phoneNumber, contact)
@@ -246,40 +246,77 @@ Deno.serve(async (req: Request) => {
           },
         },
       )
-
       if (msgError) {
         errors.push({ remoteJid: target.queryJid, error: msgError })
         continue
       }
 
       const messages = extractMessages(msgData)
+
+      // Historical records sometimes expose the phone JID only inside message keys.
+      // Promote it to the contact identity as soon as it becomes available.
+      if (!identity.phoneNumber) {
+        for (const msg of messages) {
+          const messageIdentity = resolveWhatsAppIdentity(
+            String(msg?.key?.remoteJid ?? ''),
+            String(msg?.key?.remoteJidAlt ?? ''),
+          )
+          if (!messageIdentity.phoneNumber) continue
+
+          const canonical = byPhone.get(messageIdentity.phoneNumber)
+          if (canonical && canonical.id !== contact.id) {
+            contact = canonical
+          } else {
+            const identityPatch = {
+              remote_jid: messageIdentity.remoteJid,
+              lid_jid: messageIdentity.lidJid || identity.lidJid,
+              phone_number: messageIdentity.phoneNumber,
+            }
+            const { data: updated, error: identityError } = await db
+              .from('whatsapp_contacts')
+              .update(identityPatch)
+              .eq('id', contact.id)
+              .select()
+              .single()
+            if (!identityError && updated) contact = updated
+          }
+
+          identity = messageIdentity
+          byRemote.set(identity.remoteJid, contact)
+          if (identity.lidJid) byLid.set(identity.lidJid, contact)
+          if (identity.phoneNumber) byPhone.set(identity.phoneNumber, contact)
+          resolvedPhones++
+          break
+        }
+      }
+
       let latestTimestamp: string | null = null
-
-      for (const msg of messages) {
+      const rows = messages.flatMap((msg: any) => {
         const messageId = msg?.key?.id
-        if (!messageId) continue
-
+        if (!messageId) return []
         const timestamp = messageTimestamp(msg)
         if (!latestTimestamp || timestamp > latestTimestamp) latestTimestamp = timestamp
+        return [{
+          user_id: tenantUserId,
+          contact_id: contact.id,
+          message_id: messageId,
+          from_me: msg?.key?.fromMe ?? false,
+          text: getText(msg),
+          type: msg?.messageType || 'text',
+          timestamp,
+          raw: msg,
+        }]
+      })
 
+      if (rows.length) {
         const { error: upsertError } = await db
           .from('whatsapp_messages')
-          .upsert(
-            {
-              user_id: tenantUserId,
-              contact_id: contact.id,
-              message_id: messageId,
-              from_me: msg?.key?.fromMe ?? false,
-              text: getText(msg),
-              type: msg?.messageType || 'text',
-              timestamp,
-              raw: msg,
-            },
-            { onConflict: 'user_id,message_id' },
-          )
-
-        if (upsertError) errors.push({ remoteJid: target.queryJid, error: upsertError.message })
-        else synced++
+          .upsert(rows, { onConflict: 'user_id,message_id' })
+        if (upsertError) {
+          errors.push({ remoteJid: target.queryJid, error: upsertError.message })
+        } else {
+          synced += rows.length
+        }
       }
 
       if (latestTimestamp) {
@@ -290,14 +327,25 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    const totalMs = Math.round(performance.now() - startedAt)
+    console.log('[sync-messages] completed', {
+      conversations,
+      synced,
+      resolvedPhones,
+      errors: errors.length,
+      totalMs,
+    })
+
     return jsonResponse({
       success: errors.length === 0,
       source: 'chats',
       synced,
       conversations,
       createdContacts,
+      resolvedPhones,
       totalChats: targets.length,
       rejectedInternalIds,
+      totalMs,
       errors: errors.slice(0, 20),
     })
   } catch (err) {
