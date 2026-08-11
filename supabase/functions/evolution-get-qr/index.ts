@@ -14,8 +14,14 @@ function normalizeQR(data: any): { base64: string | null; connected: boolean; cr
   const state = instance?.state ?? instance?.connectionStatus ?? data?.state ?? null
   const base64 = instance?.qrcode?.base64 ?? data?.base64 ?? null
   const connected = state === 'open' || state === 'CONNECTED'
-  const creating = state === 'creating' || instance?.qrcode?.count === 0
+  const creating = state === 'creating' || state === 'connecting' || instance?.qrcode?.count === 0
   return { base64, connected, creating }
+}
+
+async function connectionState(instanceName: string) {
+  return evolutionFetch(`/instance/connectionState/${encodeURIComponent(instanceName)}`, {
+    method: 'GET',
+  })
 }
 
 Deno.serve(async (req: Request) => {
@@ -62,6 +68,37 @@ Deno.serve(async (req: Request) => {
     )
 
     if (error) {
+      // Evolution can return HTTP 400 while a fresh Baileys instance is still
+      // initializing. Confirm its state before surfacing an error to the UI.
+      if (status === 400) {
+        const stateResult = await connectionState(instanceName)
+        const state = (stateResult.data as any)?.instance?.state ?? (stateResult.data as any)?.state ?? null
+        if (!stateResult.error && ['connecting', 'creating'].includes(String(state ?? '').toLowerCase())) {
+          await db
+            .from('user_integrations')
+            .update({ status: 'CONNECTING', updated_at: now })
+            .eq('id', integration.id)
+
+          if (integration.channel_id) {
+            await db
+              .from('channels')
+              .update({ status: 'CONNECTING', updated_at: now })
+              .eq('id', integration.channel_id)
+          }
+
+          return jsonResponse({
+            success: true,
+            integrationId: integration.id,
+            channelId: integration.channel_id,
+            connected: false,
+            creating: true,
+            error: 'qr_not_ready_yet',
+            fullHistoryConfigured: true,
+            webhookConfigured: true,
+          })
+        }
+      }
+
       if (ensured.created) {
         return jsonResponse({
           success: true,
