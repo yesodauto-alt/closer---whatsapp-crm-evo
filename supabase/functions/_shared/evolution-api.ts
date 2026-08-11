@@ -5,22 +5,16 @@ export interface EvolutionApiConfig {
   apiKey: string
 }
 
+const CANONICAL_EVOLUTION_URL = 'https://evolution.yesodautomation.com.br'
+
 export function getEvolutionConfig(): EvolutionApiConfig {
-  const baseUrl = (Deno.env.get('EVOLUTION_API_URL') ?? '').trim().replace(/\/+$/, '')
+  const baseUrl = CANONICAL_EVOLUTION_URL
   const apiKey = (Deno.env.get('EVOLUTION_API_KEY') ?? '').trim()
 
-  if (!baseUrl) {
-    throw new Error(
-      'EVOLUTION_API_URL environment variable is not set or is empty. Please configure the Evolution API URL in your edge function secrets.',
-    )
-  }
   if (!apiKey) {
     throw new Error(
       'EVOLUTION_API_KEY environment variable is not set or is empty. Please configure the Evolution API key in your edge function secrets.',
     )
-  }
-  if (!baseUrl.startsWith('http://') && !baseUrl.startsWith('https://')) {
-    throw new Error(`EVOLUTION_API_URL must start with http:// or https:// — got: "${baseUrl}"`)
   }
 
   return { baseUrl, apiKey }
@@ -47,11 +41,13 @@ export async function evolutionFetch<T = any>(
         ...options.headers,
       },
       body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: AbortSignal.timeout(20000),
     })
   } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown connection error'
     return {
       data: null,
-      error: `Failed to connect to Evolution API at ${url}: ${err.message}`,
+      error: `Failed to connect to Evolution API at ${url}: ${message}`,
       status: 502,
     }
   }
@@ -63,7 +59,7 @@ export async function evolutionFetch<T = any>(
     const preview = text.substring(0, 300).replace(/\n/g, ' ')
     return {
       data: null,
-      error: `Evolution API returned a non-JSON response (status ${response.status}, content-type: "${contentType}") from URL: ${url}. This usually means the API URL is incorrect. Response preview: ${preview}`,
+      error: `Evolution API returned a non-JSON response (status ${response.status}, content-type: "${contentType}") from URL: ${url}. Response preview: ${preview}`,
       status: response.status >= 400 ? response.status : 502,
     }
   }

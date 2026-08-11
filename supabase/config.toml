@@ -3,3 +3,6 @@ verify_jwt = false
 
 [functions.evolution-sync-messages]
 verify_jwt = false
+
+[functions.organization-send-message]
+verify_jwt = false

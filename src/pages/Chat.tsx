@@ -20,6 +20,7 @@ import { toast } from 'sonner'
 import { format, isToday, isYesterday } from 'date-fns'
 import { ptBR, enUS } from 'date-fns/locale'
 import { cn } from '@/lib/utils'
+import { formatContactPhone } from '@/lib/contact-phone'
 import {
   Dialog,
   DialogContent,
@@ -234,9 +235,7 @@ export default function Chat() {
                 {contact.push_name || t('unknown')}
               </span>
               <span className="text-[12px] sm:text-[13px] font-semibold text-muted-foreground truncate">
-                {contact.phone_number
-                  ? `+${contact.phone_number}`
-                  : contact.remote_jid.split('@')[0]}
+                {formatContactPhone(contact) || '—'}
               </span>
             </div>
           </div>

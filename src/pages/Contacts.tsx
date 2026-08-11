@@ -24,6 +24,7 @@ import { ptBR, enUS } from 'date-fns/locale'
 import { Button } from '@/components/ui/button'
 import { getBadgeColor } from './Dashboard'
 import { cn } from '@/lib/utils'
+import { formatContactPhone } from '@/lib/contact-phone'
 
 const CATEGORIES = [
   { id: 'All', labelKey: 'all', icon: UserRound },
@@ -144,9 +145,7 @@ export default function Contacts() {
                     {contact.push_name || t('unknown')}
                   </h3>
                   <p className="text-sm font-semibold text-muted-foreground truncate">
-                    {contact.phone_number
-                      ? `+${contact.phone_number}`
-                      : contact.remote_jid.split('@')[0]}
+                    {formatContactPhone(contact) || '—'}
                   </p>
                 </div>
 

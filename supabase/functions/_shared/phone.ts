@@ -1,42 +1,85 @@
-// Single source of truth for Brazilian phone normalization.
-// Keeps two concepts separate:
-//   - remote_jid   = original WhatsApp identifier (never modified)
+// Single source of truth for WhatsApp/Brazilian phone identity.
+// Keeps three concepts separate:
+//   - remote_jid   = canonical phone-based WhatsApp JID when known
+//   - lid_jid      = WhatsApp Linked ID (@lid), never displayed as a phone number
 //   - phone_number = canonical digits only (no formatting, no @s.whatsapp.net)
 
 export function onlyDigits(input: string): string {
   return (input ?? '').replace(/\D/g, '')
 }
 
-// Extract digits from a direct WhatsApp JID: "5511999999999@s.whatsapp.net" -> "5511999999999".
-// Returns "" when the JID is not a direct number (e.g. "@g.us", "@lid", "status@broadcast").
-export function digitsFromJid(jid: string): string {
-  const jidStr = (jid ?? '').trim()
-  const before = jidStr.split('@')[0]
-  if (!/^\d+$/.test(before)) return ''
-  if (jidStr.includes('@') && !jidStr.endsWith('@s.whatsapp.net')) return ''
-  return before
+export function isPlausiblePhoneDigits(digits: string): boolean {
+  return /^\d{8,15}$/.test(digits) && !/^0+$/.test(digits)
 }
 
-// Normalize a Brazilian phone entry into canonical digits (no formatting).
-// Handles: "+55 11 99999-9999", "5511999999999", "11 99999-9999", "(11) 99999-9999", "11999999999".
-// Rules:
-//   - strip formatting, keep digits only
-//   - recognize BR country code 55; never duplicate it
-//   - never add or remove the 9th digit
+export function isLidJid(jid: string | null | undefined): boolean {
+  return String(jid ?? '').trim().endsWith('@lid')
+}
+
+export function isPhoneJid(jid: string | null | undefined): boolean {
+  const value = String(jid ?? '').trim()
+  if (!value.endsWith('@s.whatsapp.net')) return false
+  return isPlausiblePhoneDigits(value.split('@')[0])
+}
+
+// Extract digits only from a phone-based direct WhatsApp JID.
+export function digitsFromJid(jid: string): string {
+  const jidStr = (jid ?? '').trim()
+  if (!isPhoneJid(jidStr)) return ''
+  return jidStr.split('@')[0]
+}
+
+// Normalize a phone entry into canonical digits (no formatting).
+// Brazilian national numbers receive country code 55; impossible placeholders are rejected.
 export function normalizeBrazilianPhone(input: string): string {
   const digits = onlyDigits(input)
   if (!digits) return ''
 
-  const brPrefixed = digits.length >= 12 && digits.startsWith('55')
-  const looksNational = digits.length >= 10 && digits.length <= 11 && !digits.startsWith('55')
+  const normalized =
+    digits.length >= 12 && digits.startsWith('55')
+      ? digits
+      : digits.length >= 10 && digits.length <= 11 && !digits.startsWith('55')
+        ? '55' + digits
+        : digits
 
-  if (brPrefixed) return digits
-  if (looksNational) return '55' + digits
-  return digits
+  return isPlausiblePhoneDigits(normalized) ? normalized : ''
 }
 
-// Resolve the number to send to the Evolution API, preferring the authoritative JID digits
-// and falling back to the normalized phone_number.
+export interface WhatsAppIdentity {
+  remoteJid: string
+  lidJid: string | null
+  phoneNumber: string | null
+}
+
+// Resolve LID + alternate JID pairs emitted by newer WhatsApp/Baileys/Evolution versions.
+export function resolveWhatsAppIdentity(
+  primaryJid: string | null | undefined,
+  alternateJid?: string | null,
+  rawNumber?: string | null,
+): WhatsAppIdentity {
+  const primary = String(primaryJid ?? '').trim()
+  const alternate = String(alternateJid ?? '').trim()
+
+  const phoneJid = [primary, alternate].find(isPhoneJid) || ''
+  const lidJid = [primary, alternate].find(isLidJid) || null
+  const numberFromJid = phoneJid ? digitsFromJid(phoneJid) : ''
+  const numberFromField = normalizeBrazilianPhone(String(rawNumber ?? ''))
+  const phoneNumber = numberFromJid || numberFromField || null
+
+  const canonicalJid =
+    phoneJid ||
+    (phoneNumber ? `${phoneNumber}@s.whatsapp.net` : '') ||
+    primary ||
+    alternate
+
+  return {
+    remoteJid: canonicalJid,
+    lidJid,
+    phoneNumber,
+  }
+}
+
+// Resolve the number to send to the Evolution API, never treating @lid or placeholders as a phone.
 export function resolveEvolutionNumber(
   remoteJid: string | null | undefined,
   phoneNumber: string | null | undefined,

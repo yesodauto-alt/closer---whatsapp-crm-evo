@@ -2,7 +2,10 @@ import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { corsHeaders } from '../_shared/cors.ts'
 import { jsonResponse } from '../_shared/evolution-api.ts'
 import { createClient } from 'npm:@supabase/supabase-js@2'
-import { digitsFromJid, normalizeBrazilianPhone } from '../_shared/phone.ts'
+import {
+  resolveWhatsAppIdentity,
+  type WhatsAppIdentity,
+} from '../_shared/phone.ts'
 import { handleMessageUpsert } from './ai-handler.ts'
 
 const supabase = createClient(
@@ -41,14 +44,57 @@ function messageText(msg: any) {
   )
 }
 
-async function findContactByJid(userId: string, remoteJid: string) {
-  const { data } = await supabase
-    .from('whatsapp_contacts')
-    .select('*')
-    .eq('user_id', userId)
-    .eq('remote_jid', remoteJid)
-    .maybeSingle()
-  return data
+function cleanPushName(value: unknown, identity: WhatsAppIdentity): string | null | undefined {
+  if (value === undefined) return undefined
+  const name = String(value ?? '').trim()
+  if (!name) return null
+
+  const lidDigits = identity.lidJid?.split('@')[0] || ''
+  if (name === lidDigits || name === identity.phoneNumber || name === '0') return null
+  return name
+}
+
+async function findContactByIdentity(userId: string, identity: WhatsAppIdentity) {
+  if (identity.remoteJid) {
+    const { data } = await supabase
+      .from('whatsapp_contacts')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('remote_jid', identity.remoteJid)
+      .maybeSingle()
+    if (data) return data
+  }
+
+  if (identity.lidJid) {
+    const { data: byLid } = await supabase
+      .from('whatsapp_contacts')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('lid_jid', identity.lidJid)
+      .maybeSingle()
+    if (byLid) return byLid
+
+    // Compatibility with records created before lid_jid existed.
+    const { data: legacyLid } = await supabase
+      .from('whatsapp_contacts')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('remote_jid', identity.lidJid)
+      .maybeSingle()
+    if (legacyLid) return legacyLid
+  }
+
+  if (identity.phoneNumber) {
+    const { data } = await supabase
+      .from('whatsapp_contacts')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('phone_number', identity.phoneNumber)
+      .maybeSingle()
+    if (data) return data
+  }
+
+  return null
 }
 
 async function findUserIdByInstance(instanceName: string): Promise<string | null> {
@@ -61,33 +107,54 @@ async function findUserIdByInstance(instanceName: string): Promise<string | null
 }
 
 async function upsertContact(userId: string, contact: any) {
-  const remoteJid = String(
+  const primaryJid = String(
     contact?.id || contact?.jid || contact?.remoteJid || contact?.key?.remoteJid || '',
   ).trim()
-  if (!remoteJid || !isDirectJid(remoteJid)) return null
+  const alternateJid = String(
+    contact?.remoteJidAlt ||
+      contact?.jidAlt ||
+      contact?.phoneJid ||
+      contact?.key?.remoteJidAlt ||
+      '',
+  ).trim()
 
-  const rawNumber = String(contact?.number || '')
-  const phoneNumber = normalizeBrazilianPhone(rawNumber) || digitsFromJid(remoteJid) || null
+  const identity = resolveWhatsAppIdentity(
+    primaryJid,
+    alternateJid,
+    contact?.number ?? contact?.phoneNumber ?? contact?.phone,
+  )
+
+  if (!identity.remoteJid || !isDirectJid(identity.remoteJid)) return null
+
+  const existing = await findContactByIdentity(userId, identity)
   const row: Record<string, unknown> = {
     user_id: userId,
-    remote_jid: remoteJid,
-    phone_number: phoneNumber,
+    remote_jid: identity.remoteJid,
+    lid_jid: identity.lidJid,
+    phone_number: identity.phoneNumber,
   }
 
-  const pushName = contact?.pushName ?? contact?.name
+  const pushName = cleanPushName(contact?.pushName ?? contact?.name, identity)
   const profilePictureUrl = contact?.profilePictureUrl ?? contact?.profilePicUrl
-  if (pushName !== undefined) row.push_name = pushName || null
+  if (pushName !== undefined) row.push_name = pushName
   if (profilePictureUrl !== undefined) row.profile_picture_url = profilePictureUrl || null
   if (contact?.lastMessageAt) row.last_message_at = contact.lastMessageAt
 
-  const { data, error } = await supabase
-    .from('whatsapp_contacts')
-    .upsert(row, { onConflict: 'user_id,remote_jid' })
-    .select()
-    .single()
+  let query
+  if (existing) {
+    query = supabase.from('whatsapp_contacts').update(row).eq('id', existing.id)
+  } else {
+    query = supabase.from('whatsapp_contacts').insert(row)
+  }
 
+  const { data, error } = await query.select().single()
   if (error) {
-    console.error('[evolution-webhook] contact upsert failed', { remoteJid, error: error.message })
+    console.error('[evolution-webhook] contact upsert failed', {
+      primaryJid,
+      alternateJid,
+      canonicalJid: identity.remoteJid,
+      error: error.message,
+    })
     return null
   }
   return data
@@ -114,17 +181,43 @@ async function handleMessagesUpsert(event: any, instance: string) {
   let processed = 0
 
   for (const msg of messages) {
-    const remoteJid = String(msg?.key?.remoteJid || '').trim()
+    const primaryJid = String(msg?.key?.remoteJid || '').trim()
+    const alternateJid = String(msg?.key?.remoteJidAlt || '').trim()
     const messageId = msg?.key?.id
-    if (!remoteJid || !messageId || !isDirectJid(remoteJid)) continue
+    if (!primaryJid || !messageId || !isDirectJid(primaryJid)) continue
 
-    let contact = await findContactByJid(userId, remoteJid)
+    const identity = resolveWhatsAppIdentity(primaryJid, alternateJid)
+    let contact = await findContactByIdentity(userId, identity)
     if (!contact) {
       contact = await upsertContact(userId, {
-        id: remoteJid,
+        id: primaryJid,
+        remoteJidAlt: alternateJid,
         pushName: msg?.pushName,
-        number: digitsFromJid(remoteJid),
       })
+    } else {
+      // Enrich legacy LID records as soon as an alternate phone JID becomes available.
+      const updates: Record<string, unknown> = {}
+      if (identity.phoneNumber && !contact.phone_number) updates.phone_number = identity.phoneNumber
+      if (identity.lidJid && !contact.lid_jid) updates.lid_jid = identity.lidJid
+      if (identity.remoteJid && contact.remote_jid !== identity.remoteJid) {
+        const { data: collision } = await supabase
+          .from('whatsapp_contacts')
+          .select('id')
+          .eq('user_id', userId)
+          .eq('remote_jid', identity.remoteJid)
+          .neq('id', contact.id)
+          .maybeSingle()
+        if (!collision) updates.remote_jid = identity.remoteJid
+      }
+      if (Object.keys(updates).length) {
+        const { data: updated } = await supabase
+          .from('whatsapp_contacts')
+          .update(updates)
+          .eq('id', contact.id)
+          .select()
+          .single()
+        if (updated) contact = updated
+      }
     }
     if (!contact) continue
 
@@ -155,11 +248,12 @@ async function handleMessagesUpsert(event: any, instance: string) {
       continue
     }
 
+    const pushName = cleanPushName(msg?.pushName, identity)
     await supabase
       .from('whatsapp_contacts')
       .update({
         last_message_at: timestamp,
-        ...(msg?.pushName && !contact.push_name ? { push_name: msg.pushName } : {}),
+        ...(pushName && !contact.push_name ? { push_name: pushName } : {}),
       })
       .eq('id', contact.id)
 
@@ -202,8 +296,6 @@ Deno.serve(async (req: Request) => {
     ).trim()
     const providedSecret = (req.headers.get('x-webhook-secret') ?? '').trim()
 
-    // Old instances may not yet send the custom header. Reject wrong explicit secrets,
-    // but keep accepting missing headers until ensureWebhookConfigured repairs them.
     if (configuredSecret && providedSecret && providedSecret !== configuredSecret) {
       return jsonResponse({ error: 'Invalid webhook secret' }, 401)
     }

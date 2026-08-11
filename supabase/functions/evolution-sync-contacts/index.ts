@@ -2,10 +2,19 @@ import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { corsHeaders } from '../_shared/cors.ts'
 import { evolutionFetch, jsonResponse, errorResponse } from '../_shared/evolution-api.ts'
 import { createServiceClient, resolveIntegration, ensureWebhookConfigured } from '../_shared/integration.ts'
-import { normalizeBrazilianPhone, digitsFromJid } from '../_shared/phone.ts'
+import { resolveWhatsAppIdentity, type WhatsAppIdentity } from '../_shared/phone.ts'
 
 function isDirectJid(jid: string) {
   return Boolean(jid) && !jid.includes('@g.us') && !jid.includes('status@broadcast')
+}
+
+function cleanPushName(value: unknown, identity: WhatsAppIdentity): string | null | undefined {
+  if (value === undefined) return undefined
+  const name = String(value ?? '').trim()
+  if (!name) return null
+  const lidDigits = identity.lidJid?.split('@')[0] || ''
+  if (name === lidDigits || name === identity.phoneNumber || name === '0') return null
+  return name
 }
 
 Deno.serve(async (req: Request) => {
@@ -43,30 +52,69 @@ Deno.serve(async (req: Request) => {
     const errors: Array<{ remoteJid: string; error: string }> = []
 
     for (const contact of contacts) {
-      const remoteJid = String(contact?.id || contact?.jid || contact?.remoteJid || '').trim()
-      if (!remoteJid || !isDirectJid(remoteJid)) {
+      const primaryJid = String(contact?.id || contact?.jid || contact?.remoteJid || '').trim()
+      const alternateJid = String(
+        contact?.remoteJidAlt || contact?.jidAlt || contact?.phoneJid || '',
+      ).trim()
+      const identity = resolveWhatsAppIdentity(
+        primaryJid,
+        alternateJid,
+        contact?.number ?? contact?.phoneNumber ?? contact?.phone,
+      )
+
+      if (!identity.remoteJid || !isDirectJid(identity.remoteJid)) {
         skipped++
         continue
       }
 
-      const rawNumber = String(contact?.number || '')
-      const canonicalPhone = normalizeBrazilianPhone(rawNumber) || digitsFromJid(remoteJid)
-      const row: Record<string, unknown> = {
-        user_id: tenantUserId,
-        remote_jid: remoteJid,
-        phone_number: canonicalPhone || null,
+      let existing: any = null
+      const { data: byCanonical } = await db
+        .from('whatsapp_contacts')
+        .select('id')
+        .eq('user_id', tenantUserId)
+        .eq('remote_jid', identity.remoteJid)
+        .maybeSingle()
+      existing = byCanonical
+
+      if (!existing && identity.lidJid) {
+        const { data: byLid } = await db
+          .from('whatsapp_contacts')
+          .select('id')
+          .eq('user_id', tenantUserId)
+          .or(`lid_jid.eq.${identity.lidJid},remote_jid.eq.${identity.lidJid}`)
+          .limit(1)
+          .maybeSingle()
+        existing = byLid
       }
 
-      const pushName = contact?.pushName ?? contact?.name
+      if (!existing && identity.phoneNumber) {
+        const { data: byPhone } = await db
+          .from('whatsapp_contacts')
+          .select('id')
+          .eq('user_id', tenantUserId)
+          .eq('phone_number', identity.phoneNumber)
+          .maybeSingle()
+        existing = byPhone
+      }
+
+      const row: Record<string, unknown> = {
+        user_id: tenantUserId,
+        remote_jid: identity.remoteJid,
+        lid_jid: identity.lidJid,
+        phone_number: identity.phoneNumber,
+      }
+
+      const pushName = cleanPushName(contact?.pushName ?? contact?.name, identity)
       const profilePictureUrl = contact?.profilePictureUrl ?? contact?.profilePicUrl
-      if (pushName !== undefined) row.push_name = pushName || null
+      if (pushName !== undefined) row.push_name = pushName
       if (profilePictureUrl !== undefined) row.profile_picture_url = profilePictureUrl || null
 
-      const { error: upsertError } = await db
-        .from('whatsapp_contacts')
-        .upsert(row, { onConflict: 'user_id,remote_jid' })
+      const write = existing
+        ? db.from('whatsapp_contacts').update(row).eq('id', existing.id)
+        : db.from('whatsapp_contacts').insert(row)
+      const { error: writeError } = await write
 
-      if (upsertError) errors.push({ remoteJid, error: upsertError.message })
+      if (writeError) errors.push({ remoteJid: identity.remoteJid, error: writeError.message })
       else synced++
     }
 
