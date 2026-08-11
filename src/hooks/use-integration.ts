@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react'
+import React, { createContext, useContext, useEffect, useRef, useState, ReactNode } from 'react'
 import { supabase } from '@/lib/supabase/client'
 import { useAuth } from './use-auth'
 import { useOrganization } from './use-organization'
@@ -23,11 +23,13 @@ export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
   const { tenantUserId, loading: organizationLoading } = useOrganization()
   const [integration, setIntegration] = useState<UserIntegration | null>(null)
   const [loading, setLoading] = useState(true)
+  const contactSyncAttemptedRef = useRef<string | null>(null)
 
   useEffect(() => {
     if (!user) {
       setIntegration(null)
       setLoading(false)
+      contactSyncAttemptedRef.current = null
       return
     }
 
@@ -108,6 +110,7 @@ export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
         (payload) => {
           if (payload.eventType === 'DELETE') {
             setIntegration(null)
+            contactSyncAttemptedRef.current = null
             return
           }
           setIntegration((prev) => ({
@@ -122,6 +125,29 @@ export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
       supabase.removeChannel(channel)
     }
   }, [user, tenantUserId, organizationLoading])
+
+  useEffect(() => {
+    if (!integration?.id || integration.status !== 'CONNECTED') return
+    if (contactSyncAttemptedRef.current === integration.id) return
+
+    contactSyncAttemptedRef.current = integration.id
+
+    void supabase.functions.invoke('evolution-sync-contacts').then(({ data, error }) => {
+      if (error || data?.error) {
+        console.error(
+          '[useIntegration] Automatic Evolution contact sync failed:',
+          error?.message || data?.error,
+        )
+        return
+      }
+
+      console.info('[useIntegration] Evolution contacts synchronized:', {
+        synced: data?.synced ?? 0,
+        total: data?.total ?? 0,
+        webhookConfigured: data?.webhookConfigured ?? false,
+      })
+    })
+  }, [integration?.id, integration?.status])
 
   return React.createElement(
     IntegrationContext.Provider,
