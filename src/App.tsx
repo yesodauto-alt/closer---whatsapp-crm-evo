@@ -17,9 +17,11 @@ import Chat from './pages/Chat'
 import Agents from './pages/Agents'
 import Products from './pages/Products'
 import Teams from './pages/Teams'
+import Channels from './pages/Channels'
+import Priorities from './pages/Priorities'
 import NotFound from './pages/NotFound'
 import Onboarding from './pages/Onboarding'
-import { Channels, ModulePage, Priorities } from './pages/Workspace'
+import { ModulePage } from './pages/Workspace'
 
 const App = () => (
   <LanguageProvider>
@@ -38,8 +40,8 @@ const App = () => (
                 <Route index element={<Dashboard />} />
                 <Route path="onboarding" element={<Onboarding />} />
                 <Route path="pipeline" element={<Pipeline />} />
-                <Route path="contacts" element={<Contacts />} />
-                <Route path="conversations" element={<Contacts />} />
+                <Route path="contacts" element={<Contacts mode="contacts" />} />
+                <Route path="conversations" element={<Contacts mode="conversations" />} />
                 <Route path="chat/:id" element={<Chat />} />
                 <Route path="priorities" element={<Priorities />} />
                 <Route path="channels" element={<Channels />} />
