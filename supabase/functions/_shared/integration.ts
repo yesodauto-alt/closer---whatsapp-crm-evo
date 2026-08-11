@@ -112,6 +112,67 @@ export async function resolveIntegration(req: Request) {
   return { user, integration, tenantUserId, organizationId }
 }
 
+type EvolutionSettings = {
+  rejectCall: boolean
+  msgCall: string
+  groupsIgnore: boolean
+  alwaysOnline: boolean
+  readMessages: boolean
+  readStatus: boolean
+  syncFullHistory: boolean
+  wavoipToken: string
+}
+
+function normalizedSettings(data: any): EvolutionSettings {
+  const settings = data?.settings ?? data ?? {}
+  return {
+    rejectCall: settings?.rejectCall === true,
+    msgCall: typeof settings?.msgCall === 'string' ? settings.msgCall : '',
+    groupsIgnore: settings?.groupsIgnore === true,
+    alwaysOnline: settings?.alwaysOnline === true,
+    readMessages: settings?.readMessages === true,
+    readStatus: settings?.readStatus === true,
+    syncFullHistory: true,
+    wavoipToken: typeof settings?.wavoipToken === 'string' ? settings.wavoipToken : '',
+  }
+}
+
+/**
+ * Full-history sync must be enabled before the QR is scanned. Evolution/Baileys
+ * only receives the account's historical chats/contacts/messages during the
+ * WhatsApp history synchronization window, so silently pairing without this
+ * setting creates a permanently incomplete CRM import.
+ */
+export async function ensureFullHistoryConfigured(instanceName: string) {
+  const encoded = encodeURIComponent(instanceName)
+  const current = await evolutionFetch(`/settings/find/${encoded}`, { method: 'GET' })
+  if (current.error) {
+    return {
+      configured: false,
+      changed: false,
+      status: current.status,
+      error: `Failed to read Evolution settings: ${current.error}`,
+    }
+  }
+
+  const currentSettings = current.data?.settings ?? current.data ?? {}
+  if (currentSettings?.syncFullHistory === true) {
+    return { configured: true, changed: false, status: 200, error: null }
+  }
+
+  const update = await evolutionFetch(`/settings/set/${encoded}`, {
+    method: 'POST',
+    body: normalizedSettings(current.data),
+  })
+
+  return {
+    configured: !update.error,
+    changed: !update.error,
+    status: update.status,
+    error: update.error ? `Failed to enable full history sync: ${update.error}` : null,
+  }
+}
+
 export async function ensureInstanceExists(
   instanceName: string,
 ): Promise<{ created: boolean; data: unknown; status: number; error: string | null }> {
@@ -136,7 +197,12 @@ export async function ensureInstanceExists(
 
   const create = await evolutionFetch('/instance/create', {
     method: 'POST',
-    body: { instanceName, qrcode: true, integration: 'WHATSAPP-BAILEYS' },
+    body: {
+      instanceName,
+      qrcode: true,
+      integration: 'WHATSAPP-BAILEYS',
+      syncFullHistory: true,
+    },
   })
   return { created: true, data: create.data, status: create.status, error: create.error }
 }
