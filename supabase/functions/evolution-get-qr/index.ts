@@ -22,8 +22,15 @@ Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
-    const { user, integration } = await resolveIntegration(req)
-    if (!user || !integration) return errorResponse('Unauthorized', 401)
+    const body = await req.json().catch(() => ({}))
+    const integrationId = String(body?.integrationId ?? '').trim() || null
+    const channelId = String(body?.channelId ?? '').trim() || null
+
+    const { user, integration } = await resolveIntegration(req, {
+      integrationId,
+      channelId,
+    })
+    if (!user || !integration) return errorResponse('Unauthorized or integration not found', 401)
     if (!integration.instance_name) return errorResponse('Integration has no instance_name', 400)
 
     const instanceName = integration.instance_name
@@ -32,9 +39,6 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ success: true, connected: false, creating: true, error: ensured.error })
     }
 
-    // These two guarantees must be in place before the user scans the QR.
-    // Otherwise WhatsApp can pair successfully while the CRM permanently misses
-    // the account's historical data.
     const history = await ensureFullHistoryConfigured(instanceName)
     if (!history.configured) {
       return errorResponse(history.error || 'Full history sync could not be enabled', history.status || 502)
@@ -46,9 +50,10 @@ Deno.serve(async (req: Request) => {
     }
 
     const db = createServiceClient()
+    const now = new Date().toISOString()
     await db
       .from('user_integrations')
-      .update({ is_webhook_enabled: true, updated_at: new Date().toISOString() })
+      .update({ is_webhook_enabled: true, updated_at: now })
       .eq('id', integration.id)
 
     const { data, error, status } = await evolutionFetch(
@@ -60,6 +65,8 @@ Deno.serve(async (req: Request) => {
       if (ensured.created) {
         return jsonResponse({
           success: true,
+          integrationId: integration.id,
+          channelId: integration.channel_id,
           connected: false,
           creating: true,
           error: 'qr_not_ready_yet',
@@ -75,11 +82,20 @@ Deno.serve(async (req: Request) => {
     if (qr.connected) {
       await db
         .from('user_integrations')
-        .update({ status: 'CONNECTED', updated_at: new Date().toISOString() })
+        .update({ status: 'CONNECTED', updated_at: now })
         .eq('id', integration.id)
+
+      if (integration.channel_id) {
+        await db
+          .from('channels')
+          .update({ status: 'CONNECTED', updated_at: now })
+          .eq('id', integration.channel_id)
+      }
 
       return jsonResponse({
         success: true,
+        integrationId: integration.id,
+        channelId: integration.channel_id,
         connected: true,
         base64: null,
         fullHistoryConfigured: true,
@@ -88,8 +104,22 @@ Deno.serve(async (req: Request) => {
     }
 
     if (qr.base64) {
+      await db
+        .from('user_integrations')
+        .update({ status: 'WAITING_QR', updated_at: now })
+        .eq('id', integration.id)
+
+      if (integration.channel_id) {
+        await db
+          .from('channels')
+          .update({ status: 'WAITING_QR', updated_at: now })
+          .eq('id', integration.channel_id)
+      }
+
       return jsonResponse({
         success: true,
+        integrationId: integration.id,
+        channelId: integration.channel_id,
         connected: false,
         creating: false,
         base64: qr.base64,
@@ -100,6 +130,8 @@ Deno.serve(async (req: Request) => {
 
     return jsonResponse({
       success: true,
+      integrationId: integration.id,
+      channelId: integration.channel_id,
       connected: false,
       creating: true,
       error: 'qr_not_ready_yet',
