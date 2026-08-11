@@ -36,22 +36,28 @@ Deno.serve(async (request) => {
     try {
       const { data: contact, error: contactError } = await db
         .from('whatsapp_contacts')
-        .select('id, user_id, remote_jid, phone_number')
+        .select('id, user_id, integration_id, remote_jid, phone_number')
         .eq('id', job.contact_id)
         .single()
       if (contactError || !contact) throw new Error('Contato não encontrado')
 
-      const { data: integration, error: integrationError } = await db
+      let integrationQuery = db
         .from('user_integrations')
-        .select('evolution_api_url, evolution_api_key, instance_name')
-        .eq('user_id', contact.user_id)
-        .single()
+        .select('id, evolution_api_url, evolution_api_key, instance_name')
+
+      integrationQuery = contact.integration_id
+        ? integrationQuery.eq('id', contact.integration_id)
+        : integrationQuery.eq('user_id', contact.user_id).eq('is_primary', true)
+
+      const { data: integration, error: integrationError } = await integrationQuery
+        .limit(1)
+        .maybeSingle()
       if (integrationError || !integration) throw new Error('Integração Evolution não encontrada')
 
       const evolutionUrl = (
         integration.evolution_api_url ||
         Deno.env.get('EVOLUTION_API_URL') ||
-        ''
+        'https://evolution.yesodautomation.com.br'
       ).replace(/\/$/, '')
       const evolutionKey = integration.evolution_api_key || Deno.env.get('EVOLUTION_API_KEY')
       if (!evolutionUrl || !evolutionKey || !integration.instance_name) {
@@ -65,6 +71,7 @@ Deno.serve(async (request) => {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', apikey: evolutionKey },
           body: JSON.stringify({ number, text: job.text }),
+          signal: AbortSignal.timeout(20000),
         },
       )
       const payload = await response.json().catch(() => ({}))
@@ -77,6 +84,7 @@ Deno.serve(async (request) => {
       await db.from('whatsapp_messages').upsert(
         {
           user_id: contact.user_id,
+          integration_id: integration.id,
           contact_id: contact.id,
           message_id: messageId,
           from_me: true,
@@ -85,7 +93,7 @@ Deno.serve(async (request) => {
           timestamp: new Date().toISOString(),
           raw: payload,
         },
-        { onConflict: 'user_id,message_id' },
+        { onConflict: 'integration_id,message_id' },
       )
 
       await db
