@@ -22,7 +22,10 @@ const json = (request: Request, body: unknown, status = 200) =>
     headers: { ...corsHeaders(request), 'Content-Type': 'application/json' },
   })
 
+const elapsed = (start: number) => Math.round(performance.now() - start)
+
 Deno.serve(async (request) => {
+  const startedAt = performance.now()
   if (request.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders(request) })
   if (request.method !== 'POST') return json(request, { error: 'Method not allowed' }, 405)
 
@@ -38,12 +41,18 @@ Deno.serve(async (request) => {
 
   const userDb = createClient(supabaseUrl, anonKey, {
     global: { headers: { Authorization: `Bearer ${token}` } },
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  })
+  const adminDb = createClient(supabaseUrl, serviceRoleKey, {
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
   })
 
+  const authStart = performance.now()
   const {
     data: { user },
     error: userError,
   } = await userDb.auth.getUser(token)
+  const authMs = elapsed(authStart)
   if (userError || !user) return json(request, { error: 'Unauthorized' }, 401)
 
   const body = await request.json().catch(() => ({}))
@@ -51,26 +60,24 @@ Deno.serve(async (request) => {
   const text = String(body.text || '').trim()
   if (!contactId || !text) return json(request, { error: 'contactId e text são obrigatórios' }, 400)
 
-  const { data: allowedContact, error: accessError } = await userDb
-    .from('whatsapp_contacts')
-    .select('id')
-    .eq('id', contactId)
-    .single()
-  if (accessError || !allowedContact) return json(request, { error: 'Contato não autorizado' }, 403)
-
-  const adminDb = createClient(supabaseUrl, serviceRoleKey)
-  const { data: contact, error: contactError } = await adminDb
+  // This RLS-scoped read both authorizes the current user and returns the contact data,
+  // avoiding a second round-trip for the same record.
+  const contactStart = performance.now()
+  const { data: contact, error: contactError } = await userDb
     .from('whatsapp_contacts')
     .select('id, user_id, remote_jid, phone_number')
     .eq('id', contactId)
     .single()
-  if (contactError || !contact) return json(request, { error: 'Contato não encontrado' }, 404)
+  const contactMs = elapsed(contactStart)
+  if (contactError || !contact) return json(request, { error: 'Contato não autorizado' }, 403)
 
+  const integrationStart = performance.now()
   const { data: integration, error: integrationError } = await adminDb
     .from('user_integrations')
     .select('evolution_api_url, evolution_api_key, instance_name')
     .eq('user_id', contact.user_id)
     .single()
+  const integrationMs = elapsed(integrationStart)
   if (integrationError || !integration) return json(request, { error: 'Integração não encontrada' }, 404)
 
   const evolutionUrl = (integration.evolution_api_url || CANONICAL_EVOLUTION_URL).replace(/\/$/, '')
@@ -83,6 +90,7 @@ Deno.serve(async (request) => {
   if (!number) return json(request, { error: 'Contato sem número válido para envio' }, 400)
 
   let response: Response
+  const evolutionStart = performance.now()
   try {
     response = await fetch(
       `${evolutionUrl}/message/sendText/${encodeURIComponent(integration.instance_name)}`,
@@ -94,9 +102,18 @@ Deno.serve(async (request) => {
       },
     )
   } catch (error) {
+    const evolutionMs = elapsed(evolutionStart)
     const message = error instanceof Error ? error.message : 'Falha de conexão com Evolution API'
-    return json(request, { error: `Evolution indisponível: ${message}`, target: evolutionUrl }, 502)
+    console.error('[send-message] Evolution connection failed', {
+      authMs,
+      contactMs,
+      integrationMs,
+      evolutionMs,
+      totalMs: elapsed(startedAt),
+    })
+    return json(request, { error: `Evolution indisponível: ${message}` }, 502)
   }
+  const evolutionMs = elapsed(evolutionStart)
 
   const responseText = await response.text()
   let payload: any = {}
@@ -109,27 +126,59 @@ Deno.serve(async (request) => {
   if (!response.ok) {
     const evolutionError =
       payload?.message || payload?.error || payload?.response?.message || `Evolution HTTP ${response.status}`
+    console.error('[send-message] Evolution rejected message', {
+      status: response.status,
+      authMs,
+      contactMs,
+      integrationMs,
+      evolutionMs,
+      totalMs: elapsed(startedAt),
+    })
     return json(request, { error: evolutionError, evolutionStatus: response.status }, 502)
   }
 
   const messageId = payload?.key?.id || payload?.message?.key?.id || payload?.id || crypto.randomUUID()
   const timestamp = new Date().toISOString()
-  const { error: messageError } = await adminDb.from('whatsapp_messages').upsert(
-    {
-      user_id: contact.user_id,
-      contact_id: contact.id,
-      message_id: messageId,
-      from_me: true,
-      text,
-      type: 'conversation',
-      timestamp,
-      raw: payload,
-    },
-    { onConflict: 'user_id,message_id' },
-  )
-  if (messageError) return json(request, { error: messageError.message }, 500)
+  const persistStart = performance.now()
 
-  await adminDb.from('whatsapp_contacts').update({ last_message_at: timestamp }).eq('id', contact.id)
+  const [messageResult, contactResult] = await Promise.all([
+    adminDb.from('whatsapp_messages').upsert(
+      {
+        user_id: contact.user_id,
+        contact_id: contact.id,
+        message_id: messageId,
+        from_me: true,
+        text,
+        type: 'conversation',
+        timestamp,
+        raw: payload,
+      },
+      { onConflict: 'user_id,message_id' },
+    ),
+    adminDb.from('whatsapp_contacts').update({ last_message_at: timestamp }).eq('id', contact.id),
+  ])
+  const persistMs = elapsed(persistStart)
 
-  return json(request, { success: true, messageId })
+  if (messageResult.error) return json(request, { error: messageResult.error.message }, 500)
+  if (contactResult.error) {
+    console.warn('[send-message] Message sent but contact timestamp update failed', {
+      error: contactResult.error.message,
+    })
+  }
+
+  const totalMs = elapsed(startedAt)
+  console.log('[send-message] timing', {
+    authMs,
+    contactMs,
+    integrationMs,
+    evolutionMs,
+    persistMs,
+    totalMs,
+  })
+
+  return json(request, {
+    success: true,
+    messageId,
+    timing: { authMs, contactMs, integrationMs, evolutionMs, persistMs, totalMs },
+  })
 })
