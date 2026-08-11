@@ -67,6 +67,7 @@ export interface WhatsAppContact {
   id: string
   user_id: string
   remote_jid: string
+  lid_jid?: string | null
   phone_number: string | null
   push_name: string | null
   profile_picture_url: string | null
