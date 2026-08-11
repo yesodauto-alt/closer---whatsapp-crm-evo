@@ -5,10 +5,9 @@ import {
   createServiceClient,
   resolveIntegration,
   ensureInstanceExists,
+  ensureWebhookConfigured,
 } from '../_shared/integration.ts'
 
-// Normalize the Evolution connection response into the shape the frontend already consumes:
-// { base64, connected, creating, error }.
 function normalizeQR(data: any): { base64: string | null; connected: boolean; creating: boolean } {
   const instance = data?.instance ?? data ?? {}
   const state = instance?.state ?? instance?.connectionStatus ?? data?.state ?? null
@@ -19,9 +18,7 @@ function normalizeQR(data: any): { base64: string | null; connected: boolean; cr
 }
 
 Deno.serve(async (req: Request) => {
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders })
-  }
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
     const { user, integration } = await resolveIntegration(req)
@@ -29,30 +26,33 @@ Deno.serve(async (req: Request) => {
     if (!integration.instance_name) return errorResponse('Integration has no instance_name', 400)
 
     const instanceName = integration.instance_name
-
-    // 1. Ensure the instance actually exists on the Evolution server before asking for a QR.
     const ensured = await ensureInstanceExists(instanceName)
     if (ensured.error) {
-      return jsonResponse({
-        success: true,
-        connected: false,
-        creating: true,
-        error: ensured.error,
-      })
+      return jsonResponse({ success: true, connected: false, creating: true, error: ensured.error })
     }
 
-    // 2. Request connection state / QR. If not connected, Evolution returns the QR base64.
-    const { data, error, status } = await evolutionFetch(`/instance/connect/${instanceName}`, {
-      method: 'GET',
-    })
+    // Repairs webhook configuration for existing instances created by older builds.
+    const webhook = await ensureWebhookConfigured(instanceName)
+    const db = createServiceClient()
+    await db
+      .from('user_integrations')
+      .update({ is_webhook_enabled: webhook.configured, updated_at: new Date().toISOString() })
+      .eq('id', integration.id)
+
+    const { data, error, status } = await evolutionFetch(
+      `/instance/connect/${encodeURIComponent(instanceName)}`,
+      { method: 'GET' },
+    )
+
     if (error) {
-      // Right after creation the instance may still be initializing.
       if (ensured.created) {
         return jsonResponse({
           success: true,
           connected: false,
           creating: true,
           error: 'qr_not_ready_yet',
+          webhookConfigured: webhook.configured,
+          webhookError: webhook.error,
         })
       }
       return errorResponse(error, status)
@@ -61,16 +61,29 @@ Deno.serve(async (req: Request) => {
     const qr = normalizeQR(data)
 
     if (qr.connected) {
-      const db = createServiceClient()
       await db
         .from('user_integrations')
         .update({ status: 'CONNECTED', updated_at: new Date().toISOString() })
-        .eq('user_id', user.id)
-      return jsonResponse({ success: true, connected: true, base64: null })
+        .eq('id', integration.id)
+
+      return jsonResponse({
+        success: true,
+        connected: true,
+        base64: null,
+        webhookConfigured: webhook.configured,
+        webhookError: webhook.error,
+      })
     }
 
     if (qr.base64) {
-      return jsonResponse({ success: true, connected: false, creating: false, base64: qr.base64 })
+      return jsonResponse({
+        success: true,
+        connected: false,
+        creating: false,
+        base64: qr.base64,
+        webhookConfigured: webhook.configured,
+        webhookError: webhook.error,
+      })
     }
 
     return jsonResponse({
@@ -78,8 +91,10 @@ Deno.serve(async (req: Request) => {
       connected: false,
       creating: true,
       error: 'qr_not_ready_yet',
+      webhookConfigured: webhook.configured,
+      webhookError: webhook.error,
     })
   } catch (err) {
-    return errorResponse(err.message || 'Internal server error', 500)
+    return errorResponse(err instanceof Error ? err.message : 'Internal server error', 500)
   }
 })
