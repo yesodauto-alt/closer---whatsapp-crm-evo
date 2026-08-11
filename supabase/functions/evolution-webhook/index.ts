@@ -23,8 +23,12 @@ function normalizeEventName(value: unknown) {
 function extractItems(data: any, keys: string[]) {
   if (Array.isArray(data)) return data
   for (const key of keys) {
-    if (Array.isArray(data?.[key])) return data[key]
+    const value = data?.[key]
+    if (Array.isArray(value)) return value
+    if (Array.isArray(value?.records)) return value.records
+    if (Array.isArray(value?.data)) return value.data
   }
+  if (Array.isArray(data?.records)) return data.records
   if (data && typeof data === 'object') return [data]
   return []
 }
@@ -44,14 +48,50 @@ function messageText(msg: any) {
   )
 }
 
+function messageTimestamp(msg: any): string {
+  const raw = msg?.messageTimestamp ?? msg?.timestamp
+  if (!raw) return new Date().toISOString()
+  const numeric = Number(raw)
+  const date = Number.isFinite(numeric) && numeric > 0
+    ? new Date(numeric < 10_000_000_000 ? numeric * 1000 : numeric)
+    : new Date(raw)
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString()
+}
+
 function cleanPushName(value: unknown, identity: WhatsAppIdentity): string | null | undefined {
   if (value === undefined) return undefined
   const name = String(value ?? '').trim()
   if (!name) return null
 
   const lidDigits = identity.lidJid?.split('@')[0] || ''
-  if (name === lidDigits || name === identity.phoneNumber || name === '0') return null
+  if (
+    name === lidDigits ||
+    name === identity.phoneNumber ||
+    name === '0' ||
+    name.toLowerCase() === 'você'
+  ) return null
   return name
+}
+
+function identityKeys(identity: WhatsAppIdentity) {
+  return [identity.remoteJid, identity.lidJid, identity.phoneNumber]
+    .filter(Boolean)
+    .map((value) => String(value))
+}
+
+function rememberContact(cache: Map<string, any>, contact: any) {
+  if (!contact) return
+  if (contact.remote_jid) cache.set(String(contact.remote_jid), contact)
+  if (contact.lid_jid) cache.set(String(contact.lid_jid), contact)
+  if (contact.phone_number) cache.set(String(contact.phone_number), contact)
+}
+
+function cachedContact(cache: Map<string, any>, identity: WhatsAppIdentity) {
+  for (const key of identityKeys(identity)) {
+    const contact = cache.get(key)
+    if (contact) return contact
+  }
+  return null
 }
 
 async function findContactByIdentity(userId: string, identity: WhatsAppIdentity) {
@@ -74,7 +114,6 @@ async function findContactByIdentity(userId: string, identity: WhatsAppIdentity)
       .maybeSingle()
     if (byLid) return byLid
 
-    // Compatibility with records created before lid_jid existed.
     const { data: legacyLid } = await supabase
       .from('whatsapp_contacts')
       .select('*')
@@ -108,13 +147,19 @@ async function findUserIdByInstance(instanceName: string): Promise<string | null
 
 async function upsertContact(userId: string, contact: any) {
   const primaryJid = String(
-    contact?.id || contact?.jid || contact?.remoteJid || contact?.key?.remoteJid || '',
+    contact?.id ||
+      contact?.jid ||
+      contact?.remoteJid ||
+      contact?.key?.remoteJid ||
+      contact?.lastMessage?.key?.remoteJid ||
+      '',
   ).trim()
   const alternateJid = String(
     contact?.remoteJidAlt ||
       contact?.jidAlt ||
       contact?.phoneJid ||
       contact?.key?.remoteJidAlt ||
+      contact?.lastMessage?.key?.remoteJidAlt ||
       '',
   ).trim()
 
@@ -134,8 +179,15 @@ async function upsertContact(userId: string, contact: any) {
     phone_number: identity.phoneNumber,
   }
 
-  const pushName = cleanPushName(contact?.pushName ?? contact?.name, identity)
-  const profilePictureUrl = contact?.profilePictureUrl ?? contact?.profilePicUrl
+  const pushName = cleanPushName(
+    contact?.pushName ?? contact?.name ?? contact?.contact?.pushName ?? contact?.contact?.name,
+    identity,
+  )
+  const profilePictureUrl =
+    contact?.profilePictureUrl ??
+    contact?.profilePicUrl ??
+    contact?.profilePicture ??
+    contact?.contact?.profilePictureUrl
   if (pushName !== undefined) row.push_name = pushName
   if (profilePictureUrl !== undefined) row.profile_picture_url = profilePictureUrl || null
   if (contact?.lastMessageAt) row.last_message_at = contact.lastMessageAt
@@ -160,34 +212,85 @@ async function upsertContact(userId: string, contact: any) {
   return data
 }
 
-async function handleContacts(event: any, instance: string) {
+async function handleContactLikeSet(event: any, instance: string, keys: string[]) {
   const userId = await findUserIdByInstance(instance)
   if (!userId) return { processed: 0, reason: 'integration_not_found' }
 
-  const contacts = extractItems(event?.data, ['contacts', 'records'])
+  const items = extractItems(event?.data, keys)
   let processed = 0
-  for (const contact of contacts) {
-    const saved = await upsertContact(userId, contact)
-    if (saved) processed++
+
+  // Full-history contact/chat sets can be large. Use bounded concurrency instead
+  // of serial network round-trips, but keep it low enough to protect Postgres.
+  for (let i = 0; i < items.length; i += 10) {
+    const results = await Promise.all(
+      items.slice(i, i + 10).map((item: any) => upsertContact(userId, item)),
+    )
+    processed += results.filter(Boolean).length
   }
+
   return { processed }
 }
 
-async function handleMessagesUpsert(event: any, instance: string) {
+async function upsertMessageRows(rows: any[]) {
+  let processed = 0
+  const errors: string[] = []
+
+  for (let i = 0; i < rows.length; i += 250) {
+    const chunk = rows.slice(i, i + 250)
+    const { error } = await supabase
+      .from('whatsapp_messages')
+      .upsert(chunk, { onConflict: 'user_id,message_id' })
+
+    if (!error) {
+      processed += chunk.length
+      continue
+    }
+
+    console.error('[evolution-webhook] message batch upsert failed; falling back to rows', {
+      size: chunk.length,
+      error: error.message,
+    })
+
+    // A single malformed historical record must not discard the rest of the batch.
+    for (const row of chunk) {
+      const { error: rowError } = await supabase
+        .from('whatsapp_messages')
+        .upsert(row, { onConflict: 'user_id,message_id' })
+      if (rowError) errors.push(`${row.message_id}: ${rowError.message}`)
+      else processed++
+    }
+  }
+
+  return { processed, errors }
+}
+
+async function handleMessages(event: any, instance: string, triggerAi: boolean) {
   const userId = await findUserIdByInstance(instance)
   if (!userId) return { processed: 0, reason: 'integration_not_found' }
 
   const messages = extractItems(event?.data, ['messages', 'records'])
-  let processed = 0
+  const contactCache = new Map<string, any>()
+  const rows: any[] = []
+  const latestByContact = new Map<string, { timestamp: string; pushName?: string }>()
+  const aiCandidates: Array<{ contact: any; text: string }> = []
+
+  let skipped = 0
 
   for (const msg of messages) {
     const primaryJid = String(msg?.key?.remoteJid || '').trim()
     const alternateJid = String(msg?.key?.remoteJidAlt || '').trim()
     const messageId = msg?.key?.id
-    if (!primaryJid || !messageId || !isDirectJid(primaryJid)) continue
+    if (!primaryJid || !messageId || !isDirectJid(primaryJid)) {
+      skipped++
+      continue
+    }
 
     const identity = resolveWhatsAppIdentity(primaryJid, alternateJid)
-    let contact = await findContactByIdentity(userId, identity)
+    let contact = cachedContact(contactCache, identity)
+    if (!contact) {
+      contact = await findContactByIdentity(userId, identity)
+    }
+
     if (!contact) {
       contact = await upsertContact(userId, {
         id: primaryJid,
@@ -195,7 +298,8 @@ async function handleMessagesUpsert(event: any, instance: string) {
         pushName: msg?.pushName,
       })
     } else {
-      // Enrich legacy LID records as soon as an alternate phone JID becomes available.
+      // Promote a LID-only historical record as soon as Baileys supplies the
+      // alternate phone JID. This preserves one CRM contact across both IDs.
       const updates: Record<string, unknown> = {}
       if (identity.phoneNumber && !contact.phone_number) updates.phone_number = identity.phoneNumber
       if (identity.lidJid && !contact.lid_jid) updates.lid_jid = identity.lidJid
@@ -219,53 +323,67 @@ async function handleMessagesUpsert(event: any, instance: string) {
         if (updated) contact = updated
       }
     }
-    if (!contact) continue
-
-    const fromMe = msg?.key?.fromMe ?? false
-    const timestamp = msg?.messageTimestamp
-      ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
-      : new Date().toISOString()
-
-    const { error } = await supabase.from('whatsapp_messages').upsert(
-      {
-        user_id: userId,
-        contact_id: contact.id,
-        message_id: messageId,
-        from_me: fromMe,
-        text: messageText(msg),
-        type: msg?.messageType || 'text',
-        timestamp,
-        raw: msg,
-      },
-      { onConflict: 'user_id,message_id' },
-    )
-
-    if (error) {
-      console.error('[evolution-webhook] message upsert failed', {
-        messageId,
-        error: error.message,
-      })
+    if (!contact) {
+      skipped++
       continue
     }
 
-    const pushName = cleanPushName(msg?.pushName, identity)
-    await supabase
-      .from('whatsapp_contacts')
-      .update({
-        last_message_at: timestamp,
-        ...(pushName && !contact.push_name ? { push_name: pushName } : {}),
-      })
-      .eq('id', contact.id)
+    rememberContact(contactCache, contact)
 
-    processed++
-
+    const fromMe = msg?.key?.fromMe ?? false
+    const timestamp = messageTimestamp(msg)
     const text = messageText(msg)
-    if (!fromMe && text) {
-      await handleMessageUpsert(supabase, userId, contact, text, instance)
+
+    rows.push({
+      user_id: userId,
+      contact_id: contact.id,
+      message_id: messageId,
+      from_me: fromMe,
+      text,
+      type: msg?.messageType || 'text',
+      timestamp,
+      raw: msg,
+    })
+
+    const pushName = cleanPushName(msg?.pushName, identity)
+    const previous = latestByContact.get(contact.id)
+    if (!previous || timestamp > previous.timestamp) {
+      latestByContact.set(contact.id, {
+        timestamp,
+        ...(pushName && !contact.push_name ? { pushName } : {}),
+      })
+    }
+
+    // Historical MESSAGES_SET data must never trigger bots/AI. It represents old
+    // traffic being restored into the CRM, not a new inbound customer message.
+    if (triggerAi && !fromMe && text) {
+      aiCandidates.push({ contact, text })
     }
   }
 
-  return { processed }
+  const saved = await upsertMessageRows(rows)
+
+  for (const [contactId, latest] of latestByContact) {
+    await supabase
+      .from('whatsapp_contacts')
+      .update({
+        last_message_at: latest.timestamp,
+        ...(latest.pushName ? { push_name: latest.pushName } : {}),
+      })
+      .eq('id', contactId)
+  }
+
+  if (triggerAi) {
+    for (const candidate of aiCandidates) {
+      await handleMessageUpsert(supabase, userId, candidate.contact, candidate.text, instance)
+    }
+  }
+
+  return {
+    processed: saved.processed,
+    skipped,
+    errors: saved.errors.slice(0, 20),
+  }
 }
 
 async function handleConnectionUpdate(event: any, instance: string) {
@@ -312,15 +430,30 @@ Deno.serve(async (req: Request) => {
 
     switch (event) {
       case 'MESSAGES_SET':
+        result = await handleMessages(body, instance, false)
+        console.log('[evolution-webhook] history messages batch', {
+          instance,
+          processed: result.processed,
+          progress: body?.progress ?? null,
+          isLatest: body?.isLatest ?? null,
+        })
+        break
+
       case 'MESSAGES_UPSERT':
       case 'SEND_MESSAGE':
-        result = await handleMessagesUpsert(body, instance)
+        result = await handleMessages(body, instance, true)
         break
 
       case 'CONTACTS_SET':
       case 'CONTACTS_UPSERT':
       case 'CONTACTS_UPDATE':
-        result = await handleContacts(body, instance)
+        result = await handleContactLikeSet(body, instance, ['contacts', 'records'])
+        break
+
+      case 'CHATS_SET':
+      case 'CHATS_UPSERT':
+      case 'CHATS_UPDATE':
+        result = await handleContactLikeSet(body, instance, ['chats', 'records'])
         break
 
       case 'CONNECTION_UPDATE':
@@ -333,7 +466,15 @@ Deno.serve(async (req: Request) => {
         break
     }
 
-    return jsonResponse({ received: true, event, instance, ...result })
+    return jsonResponse({
+      received: true,
+      event,
+      instance,
+      ...(event === 'MESSAGES_SET'
+        ? { progress: body?.progress ?? null, isLatest: body?.isLatest ?? null }
+        : {}),
+      ...result,
+    })
   } catch (err) {
     console.error('[evolution-webhook] unhandled error', err)
     return jsonResponse(

@@ -5,6 +5,7 @@ import {
   createServiceClient,
   resolveIntegration,
   ensureInstanceExists,
+  ensureFullHistoryConfigured,
   ensureWebhookConfigured,
 } from '../_shared/integration.ts'
 
@@ -19,7 +20,18 @@ Deno.serve(async (req: Request) => {
     const ensured = await ensureInstanceExists(instanceName)
     if (ensured.error) return errorResponse(ensured.error, ensured.status)
 
+    // Do not let a tenant scan the QR unless Evolution is explicitly configured
+    // to request WhatsApp's historical chats, contacts and messages.
+    const history = await ensureFullHistoryConfigured(instanceName)
+    if (!history.configured) {
+      return errorResponse(history.error || 'Full history sync could not be enabled', history.status || 502)
+    }
+
     const webhook = await ensureWebhookConfigured(instanceName)
+    if (!webhook.configured) {
+      return errorResponse(webhook.error || 'Evolution webhook could not be configured', webhook.status || 502)
+    }
+
     const db = createServiceClient()
     const { data: existing } = await db
       .from('user_integrations')
@@ -31,7 +43,7 @@ Deno.serve(async (req: Request) => {
       instance_name: instanceName,
       status: 'CONNECTING',
       is_setup_completed: true,
-      is_webhook_enabled: webhook.configured,
+      is_webhook_enabled: true,
       updated_at: new Date().toISOString(),
     }
 
@@ -45,8 +57,9 @@ Deno.serve(async (req: Request) => {
       success: true,
       created: ensured.created,
       data: ensured.data,
-      webhookConfigured: webhook.configured,
-      webhookError: webhook.error,
+      fullHistoryConfigured: history.configured,
+      fullHistoryChanged: history.changed,
+      webhookConfigured: true,
     })
   } catch (err) {
     return errorResponse(err instanceof Error ? err.message : 'Internal server error', 500)
