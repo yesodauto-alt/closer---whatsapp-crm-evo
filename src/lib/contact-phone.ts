@@ -4,20 +4,24 @@ function digitsOnly(value: string | null | undefined) {
   return String(value ?? '').replace(/\D/g, '')
 }
 
+function isPlausiblePhone(digits: string) {
+  return /^\d{8,15}$/.test(digits) && !/^0+$/.test(digits)
+}
+
 export function contactPhoneDigits(contact: Pick<WhatsAppContact, 'phone_number' | 'remote_jid'>) {
   const explicit = digitsOnly(contact.phone_number)
-  if (explicit) return explicit
+  if (isPlausiblePhone(explicit)) return explicit
 
   const jid = String(contact.remote_jid ?? '').trim()
   if (!jid.endsWith('@s.whatsapp.net')) return ''
 
   const local = jid.split('@')[0]
-  return /^\d+$/.test(local) ? local : ''
+  return isPlausiblePhone(local) ? local : ''
 }
 
 export function formatPhoneNumber(value: string | null | undefined) {
   const digits = digitsOnly(value)
-  if (!digits) return ''
+  if (!isPlausiblePhone(digits)) return ''
 
   if (digits.startsWith('55')) {
     const national = digits.slice(2)
