@@ -1,28 +1,26 @@
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { corsHeaders } from '../_shared/cors.ts'
 import { jsonResponse, errorResponse } from '../_shared/evolution-api.ts'
-import { createServiceClient, resolveIntegration, ensureInstanceExists } from '../_shared/integration.ts'
+import {
+  createServiceClient,
+  resolveIntegration,
+  ensureInstanceExists,
+  ensureWebhookConfigured,
+} from '../_shared/integration.ts'
 
 Deno.serve(async (req: Request) => {
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders })
-  }
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
     const { user, integration } = await resolveIntegration(req)
     if (!user) return errorResponse('Unauthorized', 401)
 
-    // Resolve the instance name exclusively on the server: reuse the existing
-    // integration's instance when present, otherwise fall back to the user id.
-    // The client can never choose an arbitrary instance name.
     const instanceName = integration?.instance_name || user.id
 
-    // Reuse the instance if it already exists; otherwise create it. Never duplicates.
     const ensured = await ensureInstanceExists(instanceName)
-    if (ensured.error) {
-      return errorResponse(ensured.error, ensured.status)
-    }
+    if (ensured.error) return errorResponse(ensured.error, ensured.status)
 
+    const webhook = await ensureWebhookConfigured(instanceName)
     const db = createServiceClient()
     const { data: existing } = await db
       .from('user_integrations')
@@ -34,6 +32,7 @@ Deno.serve(async (req: Request) => {
       instance_name: instanceName,
       status: 'CONNECTING',
       is_setup_completed: true,
+      is_webhook_enabled: webhook.configured,
       updated_at: new Date().toISOString(),
     }
 
@@ -43,8 +42,14 @@ Deno.serve(async (req: Request) => {
       await db.from('user_integrations').insert({ user_id: user.id, ...patch })
     }
 
-    return jsonResponse({ success: true, created: ensured.created, data: ensured.data })
+    return jsonResponse({
+      success: true,
+      created: ensured.created,
+      data: ensured.data,
+      webhookConfigured: webhook.configured,
+      webhookError: webhook.error,
+    })
   } catch (err) {
-    return errorResponse(err.message || 'Internal server error', 500)
+    return errorResponse(err instanceof Error ? err.message : 'Internal server error', 500)
   }
 })
