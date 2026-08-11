@@ -12,9 +12,13 @@ import {
 function normalizeQR(data: any): { base64: string | null; connected: boolean; creating: boolean } {
   const instance = data?.instance ?? data ?? {}
   const state = instance?.state ?? instance?.connectionStatus ?? data?.state ?? null
-  const base64 = instance?.qrcode?.base64 ?? data?.base64 ?? null
+  const base64 = instance?.qrcode?.base64 ?? data?.qrcode?.base64 ?? data?.base64 ?? null
   const connected = state === 'open' || state === 'CONNECTED'
-  const creating = state === 'creating' || state === 'connecting' || instance?.qrcode?.count === 0
+  const creating =
+    state === 'creating' ||
+    state === 'connecting' ||
+    instance?.qrcode?.count === 0 ||
+    data?.count === 0
   return { base64, connected, creating }
 }
 
@@ -45,9 +49,24 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ success: true, connected: false, creating: true, error: ensured.error })
     }
 
-    const history = await ensureFullHistoryConfigured(instanceName)
-    if (!history.configured) {
-      return errorResponse(history.error || 'Full history sync could not be enabled', history.status || 502)
+    // Secondary instances created by this CRM are always created with
+    // syncFullHistory:true. A second settings probe is not required to obtain
+    // the QR and is incompatible with some Evolution builds, which return 400
+    // from /settings even while the instance itself is healthy and connecting.
+    let fullHistoryConfigured = ensured.created || instanceName.startsWith('yesod-')
+    let fullHistoryWarning: string | null = null
+
+    if (!fullHistoryConfigured) {
+      const history = await ensureFullHistoryConfigured(instanceName)
+      fullHistoryConfigured = history.configured
+      fullHistoryWarning = history.configured ? null : history.error
+      if (fullHistoryWarning) {
+        console.warn('[evolution-get-qr] Full-history settings probe failed; continuing QR flow', {
+          instanceName,
+          status: history.status,
+          error: fullHistoryWarning,
+        })
+      }
     }
 
     const webhook = await ensureWebhookConfigured(instanceName)
@@ -59,7 +78,7 @@ Deno.serve(async (req: Request) => {
     const now = new Date().toISOString()
     await db
       .from('user_integrations')
-      .update({ is_webhook_enabled: true, updated_at: now })
+      .update({ is_webhook_enabled: true, is_setup_completed: true, updated_at: now })
       .eq('id', integration.id)
 
     const { data, error, status } = await evolutionFetch(
@@ -68,38 +87,31 @@ Deno.serve(async (req: Request) => {
     )
 
     if (error) {
-      // Evolution can return HTTP 400 while a fresh Baileys instance is still
-      // initializing. Confirm its state before surfacing an error to the UI.
-      if (status === 400) {
-        const stateResult = await connectionState(instanceName)
-        const state = (stateResult.data as any)?.instance?.state ?? (stateResult.data as any)?.state ?? null
-        if (!stateResult.error && ['connecting', 'creating'].includes(String(state ?? '').toLowerCase())) {
+      const stateResult = await connectionState(instanceName)
+      const state = (stateResult.data as any)?.instance?.state ?? (stateResult.data as any)?.state ?? null
+      const normalizedState = String(state ?? '').toLowerCase()
+
+      console.warn('[evolution-get-qr] Evolution connect returned an error', {
+        instanceName,
+        connectStatus: status,
+        connectError: error,
+        connectionState: normalizedState || null,
+        stateLookupError: stateResult.error,
+      })
+
+      if (!stateResult.error && ['connecting', 'creating', 'close'].includes(normalizedState)) {
+        await db
+          .from('user_integrations')
+          .update({ status: 'CONNECTING', updated_at: now })
+          .eq('id', integration.id)
+
+        if (integration.channel_id) {
           await db
-            .from('user_integrations')
+            .from('channels')
             .update({ status: 'CONNECTING', updated_at: now })
-            .eq('id', integration.id)
-
-          if (integration.channel_id) {
-            await db
-              .from('channels')
-              .update({ status: 'CONNECTING', updated_at: now })
-              .eq('id', integration.channel_id)
-          }
-
-          return jsonResponse({
-            success: true,
-            integrationId: integration.id,
-            channelId: integration.channel_id,
-            connected: false,
-            creating: true,
-            error: 'qr_not_ready_yet',
-            fullHistoryConfigured: true,
-            webhookConfigured: true,
-          })
+            .eq('id', integration.channel_id)
         }
-      }
 
-      if (ensured.created) {
         return jsonResponse({
           success: true,
           integrationId: integration.id,
@@ -107,11 +119,19 @@ Deno.serve(async (req: Request) => {
           connected: false,
           creating: true,
           error: 'qr_not_ready_yet',
-          fullHistoryConfigured: true,
+          evolutionStatus: status,
+          evolutionError: error,
+          connectionState: normalizedState || null,
+          fullHistoryConfigured,
+          fullHistoryWarning,
           webhookConfigured: true,
         })
       }
-      return errorResponse(error, status)
+
+      return errorResponse(
+        `Evolution connect failed (${status}): ${error}${normalizedState ? ` [state=${normalizedState}]` : ''}`,
+        status || 502,
+      )
     }
 
     const qr = normalizeQR(data)
@@ -135,7 +155,8 @@ Deno.serve(async (req: Request) => {
         channelId: integration.channel_id,
         connected: true,
         base64: null,
-        fullHistoryConfigured: true,
+        fullHistoryConfigured,
+        fullHistoryWarning,
         webhookConfigured: true,
       })
     }
@@ -160,10 +181,14 @@ Deno.serve(async (req: Request) => {
         connected: false,
         creating: false,
         base64: qr.base64,
-        fullHistoryConfigured: true,
+        fullHistoryConfigured,
+        fullHistoryWarning,
         webhookConfigured: true,
       })
     }
+
+    const stateResult = await connectionState(instanceName)
+    const state = (stateResult.data as any)?.instance?.state ?? (stateResult.data as any)?.state ?? null
 
     return jsonResponse({
       success: true,
@@ -172,10 +197,14 @@ Deno.serve(async (req: Request) => {
       connected: false,
       creating: true,
       error: 'qr_not_ready_yet',
-      fullHistoryConfigured: true,
+      connectionState: state ?? null,
+      qrCount: (data as any)?.count ?? (data as any)?.qrcode?.count ?? null,
+      fullHistoryConfigured,
+      fullHistoryWarning,
       webhookConfigured: true,
     })
   } catch (err) {
+    console.error('[evolution-get-qr] Unhandled error', err)
     return errorResponse(err instanceof Error ? err.message : 'Internal server error', 500)
   }
 })
