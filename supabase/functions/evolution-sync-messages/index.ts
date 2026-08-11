@@ -60,8 +60,10 @@ function cleanPushName(value: unknown, identity: WhatsAppIdentity): string | nul
 function extractMessages(data: any): any[] {
   if (Array.isArray(data)) return data
   if (Array.isArray(data?.messages)) return data.messages
+  if (Array.isArray(data?.messages?.records)) return data.messages.records
   if (Array.isArray(data?.records)) return data.records
   if (Array.isArray(data?.data)) return data.data
+  if (Array.isArray(data?.data?.messages?.records)) return data.data.messages.records
   return []
 }
 
@@ -239,8 +241,8 @@ Deno.serve(async (req: Request) => {
           method: 'POST',
           body: {
             where: { key: { remoteJid: target.queryJid } },
-            limit,
-            offset: 0,
+            offset: limit,
+            page: 1,
           },
         },
       )
