@@ -22,27 +22,42 @@ export function isPhoneJid(jid: string | null | undefined): boolean {
   return isPlausiblePhoneDigits(value.split('@')[0])
 }
 
-// Extract digits only from a phone-based direct WhatsApp JID.
-export function digitsFromJid(jid: string): string {
-  const jidStr = (jid ?? '').trim()
-  if (!isPhoneJid(jidStr)) return ''
-  return jidStr.split('@')[0]
-}
-
 // Normalize a phone entry into canonical digits (no formatting).
-// Brazilian national numbers receive country code 55; impossible placeholders are rejected.
+// Rules for Brazil:
+// - add country code 55 to 10/11-digit national numbers;
+// - preserve 8-digit landlines (subscriber starts with 2-5);
+// - upgrade legacy 8-digit mobile numbers (subscriber starts with 6-9) to the
+//   current 9-digit mobile format by inserting the mandatory leading 9.
 export function normalizeBrazilianPhone(input: string): string {
   const digits = onlyDigits(input)
   if (!digits) return ''
 
-  const normalized =
+  let normalized =
     digits.length >= 12 && digits.startsWith('55')
       ? digits
       : digits.length >= 10 && digits.length <= 11 && !digits.startsWith('55')
         ? '55' + digits
         : digits
 
+  if (normalized.startsWith('55')) {
+    const national = normalized.slice(2)
+    if (national.length === 10) {
+      const ddd = national.slice(0, 2)
+      const subscriber = national.slice(2)
+      if (/^[6-9]\d{7}$/.test(subscriber)) {
+        normalized = `55${ddd}9${subscriber}`
+      }
+    }
+  }
+
   return isPlausiblePhoneDigits(normalized) ? normalized : ''
+}
+
+// Extract canonical digits from a direct WhatsApp JID.
+export function digitsFromJid(jid: string): string {
+  const jidStr = (jid ?? '').trim()
+  if (!isPhoneJid(jidStr)) return ''
+  return normalizeBrazilianPhone(jidStr.split('@')[0])
 }
 
 export interface WhatsAppIdentity {
@@ -67,8 +82,8 @@ export function resolveWhatsAppIdentity(
   const phoneNumber = numberFromJid || numberFromField || null
 
   const canonicalJid =
-    phoneJid ||
     (phoneNumber ? `${phoneNumber}@s.whatsapp.net` : '') ||
+    phoneJid ||
     primary ||
     alternate
 
