@@ -1,6 +1,22 @@
 import { createClient } from 'npm:@supabase/supabase-js@2'
 import { evolutionFetch } from './evolution-api.ts'
 
+export const EVOLUTION_WEBHOOK_EVENTS = [
+  'QRCODE_UPDATED',
+  'CONNECTION_UPDATE',
+  'MESSAGES_SET',
+  'MESSAGES_UPSERT',
+  'MESSAGES_UPDATE',
+  'MESSAGES_DELETE',
+  'SEND_MESSAGE',
+  'CONTACTS_SET',
+  'CONTACTS_UPSERT',
+  'CONTACTS_UPDATE',
+  'CHATS_SET',
+  'CHATS_UPSERT',
+  'CHATS_UPDATE',
+] as const
+
 export function createServiceClient() {
   const url = Deno.env.get('SUPABASE_URL')
   const key = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
@@ -61,8 +77,8 @@ export async function ensureInstanceExists(
 
   const instances = Array.isArray(list.data)
     ? (list.data as any[])
-    : Array.isArray(list.data?.instances)
-      ? (list.data.instances as any[])
+    : Array.isArray((list.data as any)?.instances)
+      ? ((list.data as any).instances as any[])
       : []
   const exists = instances.some((i: any) => (i?.instanceName ?? i?.name) === instanceName)
 
@@ -75,4 +91,34 @@ export async function ensureInstanceExists(
     body: { instanceName, qrcode: true, integration: 'WHATSAPP-BAILEYS' },
   })
   return { created: true, data: create.data, status: create.status, error: create.error }
+}
+
+export async function ensureWebhookConfigured(instanceName: string) {
+  const supabaseUrl = (Deno.env.get('SUPABASE_URL') ?? '').trim().replace(/\/+$/, '')
+  if (!supabaseUrl) {
+    return { configured: false, status: 500, error: 'SUPABASE_URL is not configured' }
+  }
+
+  const webhookSecret = (
+    Deno.env.get('EVOLUTION_WEBHOOK_SECRET') ??
+    Deno.env.get('EVOLUTION_API_KEY') ??
+    ''
+  ).trim()
+
+  const result = await evolutionFetch(`/webhook/set/${encodeURIComponent(instanceName)}`, {
+    method: 'POST',
+    body: {
+      enabled: true,
+      url: `${supabaseUrl}/functions/v1/evolution-webhook`,
+      events: [...EVOLUTION_WEBHOOK_EVENTS],
+      headers: webhookSecret ? { 'x-webhook-secret': webhookSecret } : {},
+      base64: false,
+    },
+  })
+
+  return {
+    configured: !result.error,
+    status: result.status,
+    error: result.error,
+  }
 }
