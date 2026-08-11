@@ -72,7 +72,7 @@ export const useContacts = (searchQuery: string = '', options: ContactQueryOptio
 
     const scheduleRefresh = () => {
       // A full address-book sync can emit hundreds of INSERT/UPDATE events.
-      // Collapse that event storm into one quiet refresh instead of flashing
+      // Collapse that event storm into a single quiet refresh instead of flashing
       // the loading state for every row written by the sync function.
       if (refreshTimer !== null) window.clearTimeout(refreshTimer)
       refreshTimer = window.setTimeout(() => {
