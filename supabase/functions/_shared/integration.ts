@@ -112,36 +112,11 @@ export async function resolveIntegration(req: Request) {
   return { user, integration, tenantUserId, organizationId }
 }
 
-type EvolutionSettings = {
-  rejectCall: boolean
-  msgCall: string
-  groupsIgnore: boolean
-  alwaysOnline: boolean
-  readMessages: boolean
-  readStatus: boolean
-  syncFullHistory: boolean
-  wavoipToken: string
-}
-
-function normalizedSettings(data: any): EvolutionSettings {
-  const settings = data?.settings ?? data ?? {}
-  return {
-    rejectCall: settings?.rejectCall === true,
-    msgCall: typeof settings?.msgCall === 'string' ? settings.msgCall : '',
-    groupsIgnore: settings?.groupsIgnore === true,
-    alwaysOnline: settings?.alwaysOnline === true,
-    readMessages: settings?.readMessages === true,
-    readStatus: settings?.readStatus === true,
-    syncFullHistory: true,
-    wavoipToken: typeof settings?.wavoipToken === 'string' ? settings.wavoipToken : '',
-  }
-}
-
 /**
  * Full-history sync must be enabled before the QR is scanned. Evolution/Baileys
- * only receives the account's historical chats/contacts/messages during the
- * WhatsApp history synchronization window, so silently pairing without this
- * setting creates a permanently incomplete CRM import.
+ * receives the account's historical chats, contacts and messages during the
+ * WhatsApp history synchronization window, so pairing without this setting can
+ * leave an existing account only partially represented in the CRM.
  */
 export async function ensureFullHistoryConfigured(instanceName: string) {
   const encoded = encodeURIComponent(instanceName)
@@ -160,9 +135,11 @@ export async function ensureFullHistoryConfigured(instanceName: string) {
     return { configured: true, changed: false, status: 200, error: null }
   }
 
+  // SettingsDto fields are optional. Change only this flag so existing call,
+  // presence, read-receipt and other tenant settings are never reset.
   const update = await evolutionFetch(`/settings/set/${encoded}`, {
     method: 'POST',
-    body: normalizedSettings(current.data),
+    body: { syncFullHistory: true },
   })
 
   return {
