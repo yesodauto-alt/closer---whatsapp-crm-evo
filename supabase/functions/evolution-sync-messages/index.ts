@@ -98,12 +98,18 @@ Deno.serve(async (req: Request) => {
 
   try {
     const startedAt = performance.now()
-    const { user, integration, tenantUserId } = await resolveIntegration(req)
+    const body = await req.json().catch(() => ({}))
+    const integrationId = String(body?.integrationId ?? '').trim() || null
+    const channelId = String(body?.channelId ?? '').trim() || null
+
+    const { user, integration, tenantUserId } = await resolveIntegration(req, {
+      integrationId,
+      channelId,
+    })
     if (!user || !integration || !tenantUserId) return errorResponse('Unauthorized', 401)
     if (!integration.instance_name) return errorResponse('Integration has no instance_name', 400)
 
     const instanceName = integration.instance_name
-    const body = await req.json().catch(() => ({}))
     const requestedJid = String(body?.remoteJid ?? '').trim()
     const limit = Math.min(Math.max(Number(body?.limit) || 100, 1), 100)
 
@@ -169,7 +175,7 @@ Deno.serve(async (req: Request) => {
     const { data: existingRows, error: existingError } = await db
       .from('whatsapp_contacts')
       .select('*')
-      .eq('user_id', tenantUserId)
+      .eq('integration_id', integration.id)
     if (existingError) return errorResponse(existingError.message, 500)
 
     const byRemote = new Map<string, any>()
@@ -196,6 +202,7 @@ Deno.serve(async (req: Request) => {
 
       const basePatch: Record<string, unknown> = {
         user_id: tenantUserId,
+        integration_id: integration.id,
         remote_jid: identity.remoteJid,
         lid_jid: identity.lidJid,
         phone_number: identity.phoneNumber,
@@ -253,8 +260,6 @@ Deno.serve(async (req: Request) => {
 
       const messages = extractMessages(msgData)
 
-      // Historical records sometimes expose the phone JID only inside message keys.
-      // Promote it to the contact identity as soon as it becomes available.
       if (!identity.phoneNumber) {
         for (const msg of messages) {
           const messageIdentity = resolveWhatsAppIdentity(
@@ -298,6 +303,7 @@ Deno.serve(async (req: Request) => {
         if (!latestTimestamp || timestamp > latestTimestamp) latestTimestamp = timestamp
         return [{
           user_id: tenantUserId,
+          integration_id: integration.id,
           contact_id: contact.id,
           message_id: messageId,
           from_me: msg?.key?.fromMe ?? false,
@@ -311,7 +317,7 @@ Deno.serve(async (req: Request) => {
       if (rows.length) {
         const { error: upsertError } = await db
           .from('whatsapp_messages')
-          .upsert(rows, { onConflict: 'user_id,message_id' })
+          .upsert(rows, { onConflict: 'integration_id,message_id' })
         if (upsertError) {
           errors.push({ remoteJid: target.queryJid, error: upsertError.message })
         } else {
@@ -327,8 +333,18 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    const now = new Date().toISOString()
+    if (integration.channel_id) {
+      await db
+        .from('channels')
+        .update({ last_sync_at: now, updated_at: now })
+        .eq('id', integration.channel_id)
+    }
+
     const totalMs = Math.round(performance.now() - startedAt)
     console.log('[sync-messages] completed', {
+      integrationId: integration.id,
+      channelId: integration.channel_id,
       conversations,
       synced,
       resolvedPhones,
@@ -339,6 +355,8 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({
       success: errors.length === 0,
       source: 'chats',
+      integrationId: integration.id,
+      channelId: integration.channel_id,
       synced,
       conversations,
       createdContacts,
