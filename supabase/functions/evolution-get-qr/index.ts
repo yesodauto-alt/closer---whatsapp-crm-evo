@@ -5,6 +5,7 @@ import {
   createServiceClient,
   resolveIntegration,
   ensureInstanceExists,
+  ensureFullHistoryConfigured,
   ensureWebhookConfigured,
 } from '../_shared/integration.ts'
 
@@ -31,12 +32,23 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ success: true, connected: false, creating: true, error: ensured.error })
     }
 
-    // Repairs webhook configuration for existing instances created by older builds.
+    // These two guarantees must be in place before the user scans the QR.
+    // Otherwise WhatsApp can pair successfully while the CRM permanently misses
+    // the account's historical data.
+    const history = await ensureFullHistoryConfigured(instanceName)
+    if (!history.configured) {
+      return errorResponse(history.error || 'Full history sync could not be enabled', history.status || 502)
+    }
+
     const webhook = await ensureWebhookConfigured(instanceName)
+    if (!webhook.configured) {
+      return errorResponse(webhook.error || 'Evolution webhook could not be configured', webhook.status || 502)
+    }
+
     const db = createServiceClient()
     await db
       .from('user_integrations')
-      .update({ is_webhook_enabled: webhook.configured, updated_at: new Date().toISOString() })
+      .update({ is_webhook_enabled: true, updated_at: new Date().toISOString() })
       .eq('id', integration.id)
 
     const { data, error, status } = await evolutionFetch(
@@ -51,8 +63,8 @@ Deno.serve(async (req: Request) => {
           connected: false,
           creating: true,
           error: 'qr_not_ready_yet',
-          webhookConfigured: webhook.configured,
-          webhookError: webhook.error,
+          fullHistoryConfigured: true,
+          webhookConfigured: true,
         })
       }
       return errorResponse(error, status)
@@ -70,8 +82,8 @@ Deno.serve(async (req: Request) => {
         success: true,
         connected: true,
         base64: null,
-        webhookConfigured: webhook.configured,
-        webhookError: webhook.error,
+        fullHistoryConfigured: true,
+        webhookConfigured: true,
       })
     }
 
@@ -81,8 +93,8 @@ Deno.serve(async (req: Request) => {
         connected: false,
         creating: false,
         base64: qr.base64,
-        webhookConfigured: webhook.configured,
-        webhookError: webhook.error,
+        fullHistoryConfigured: true,
+        webhookConfigured: true,
       })
     }
 
@@ -91,8 +103,8 @@ Deno.serve(async (req: Request) => {
       connected: false,
       creating: true,
       error: 'qr_not_ready_yet',
-      webhookConfigured: webhook.configured,
-      webhookError: webhook.error,
+      fullHistoryConfigured: true,
+      webhookConfigured: true,
     })
   } catch (err) {
     return errorResponse(err instanceof Error ? err.message : 'Internal server error', 500)
