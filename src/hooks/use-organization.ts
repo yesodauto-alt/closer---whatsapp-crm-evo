@@ -19,7 +19,9 @@ export function useOrganization() {
       setLoading(true)
       const { data, error } = await (supabase as any)
         .from('organization_members')
-        .select('organization_id, role, organization:organizations(id, name, slug)')
+        .select(
+          'organization_id, role, organization:organizations(id, name, slug, owner_user_id)',
+        )
         .eq('user_id', user.id)
         .eq('is_active', true)
         .limit(1)
@@ -44,6 +46,7 @@ export function useOrganization() {
   return {
     organization: membership?.organization ?? null,
     organizationId: membership?.organization_id ?? null,
+    tenantUserId: membership?.organization?.owner_user_id ?? user?.id ?? null,
     role,
     canConfigure,
     isSuperAdmin,
