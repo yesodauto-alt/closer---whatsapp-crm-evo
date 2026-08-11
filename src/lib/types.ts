@@ -1,13 +1,32 @@
 export interface UserIntegration {
   id: string
   user_id: string
+  channel_id?: string | null
+  provider?: string
+  is_primary?: boolean
   evolution_api_url: string | null
   evolution_api_key: string | null
   instance_name: string | null
-  status: 'DISCONNECTED' | 'WAITING_QR' | 'CONNECTED'
+  status: 'DISCONNECTED' | 'WAITING_QR' | 'CONNECTING' | 'CONNECTED'
   is_setup_completed?: boolean
   is_webhook_enabled?: boolean
   created_at: string
+}
+
+export interface Channel {
+  id: string
+  organization_id: string
+  name: string
+  type: 'whatsapp' | 'email' | 'telegram'
+  provider: 'evolution' | 'meta_cloud' | 'email' | 'telegram'
+  status: string
+  phone_number: string | null
+  is_active: boolean
+  metadata: Record<string, any>
+  created_by: string | null
+  last_sync_at: string | null
+  created_at: string
+  updated_at: string
 }
 
 export interface AIAgent {
@@ -66,6 +85,7 @@ export interface Product {
 export interface WhatsAppContact {
   id: string
   user_id: string
+  integration_id?: string | null
   remote_jid: string
   lid_jid?: string | null
   phone_number: string | null
@@ -83,6 +103,7 @@ export interface WhatsAppContact {
 export interface WhatsAppMessage {
   id: string
   user_id: string
+  integration_id?: string | null
   contact_id: string
   message_id: string
   from_me: boolean
