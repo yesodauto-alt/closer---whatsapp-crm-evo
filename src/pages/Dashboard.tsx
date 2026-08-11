@@ -101,16 +101,11 @@ export default function Dashboard() {
     if (isSyncing) return
 
     setIsSyncing(true)
-    setSyncProgress({ type: 'contacts', total: 0, processed: 0, status: 'running' })
+    setSyncProgress({ type: 'messages', total: 0, processed: 0, status: 'running' })
 
     try {
-      const { data: contactsData, error: contactsError } =
-        await supabase.functions.invoke('evolution-sync-contacts')
-      if (contactsError) throw contactsError
-      if (contactsData?.error) throw new Error(contactsData.error)
-      if (contactsData?.job_id) await pollJob(contactsData.job_id, 'contacts')
-
-      setSyncProgress({ type: 'messages', total: 0, processed: 0, status: 'running' })
+      // evolution-sync-messages already discovers chats and creates/updates their contacts.
+      // Calling evolution-sync-contacts first duplicated the same work and added ~6s per sync.
       const { data: messagesData, error: messagesError } =
         await supabase.functions.invoke('evolution-sync-messages')
       if (messagesError) throw messagesError
