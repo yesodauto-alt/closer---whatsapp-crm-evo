@@ -1,41 +1,39 @@
 import { useEffect, useState, useCallback } from 'react'
 import { supabase } from '@/lib/supabase/client'
 import { useAuth } from './use-auth'
+import { useOrganization } from './use-organization'
 import { WhatsAppMessage } from '@/lib/types'
 
 export const useMessages = (contactId: string | undefined) => {
   const { user } = useAuth()
+  const { tenantUserId, loading: organizationLoading } = useOrganization()
   const [messages, setMessages] = useState<WhatsAppMessage[]>([])
   const [loading, setLoading] = useState(true)
 
   const fetchMessages = useCallback(async () => {
-    if (!user || !contactId) return
+    if (!user || organizationLoading || !tenantUserId || !contactId) return
 
     const { data, error } = await supabase
       .from('whatsapp_messages')
       .select('*')
-      .eq('user_id', user.id)
+      .eq('user_id', tenantUserId)
       .eq('contact_id', contactId)
       .order('timestamp', { ascending: false })
       .limit(100)
 
-    if (error) {
-      console.error('[useMessages] Error fetching initial messages:', error)
-    }
-
-    if (data) setMessages(data as WhatsAppMessage[])
+    if (error) console.error('[useMessages] Error fetching tenant messages:', error)
+    setMessages((data as WhatsAppMessage[]) ?? [])
     setLoading(false)
-  }, [user, contactId])
+  }, [user, tenantUserId, organizationLoading, contactId])
 
   useEffect(() => {
-    if (!user || !contactId) return
+    if (!user || organizationLoading || !tenantUserId || !contactId) return
 
     setLoading(true)
     fetchMessages()
 
-    // ACCEPTANCE CRITERIA: Real-Time Integration & State Synchronization
     const channel = supabase
-      .channel(`messages_${contactId}`)
+      .channel(`messages_${tenantUserId}_${contactId}`)
       .on(
         'postgres_changes',
         {
@@ -45,41 +43,34 @@ export const useMessages = (contactId: string | undefined) => {
           filter: `contact_id=eq.${contactId}`,
         },
         (payload) => {
-          console.log('[useMessages] Realtime event received:', payload.eventType, payload.new?.id)
-
           if (payload.eventType === 'INSERT') {
             setMessages((prev) => {
               const newMsg = payload.new as WhatsAppMessage
-
-              // Prevent state duplication locally if message was optimistically added or duplicate event fired
+              if (newMsg.user_id !== tenantUserId) return prev
               if (prev.some((m) => m.id === newMsg.id || m.message_id === newMsg.message_id)) {
                 return prev
               }
-
-              // Ensure chronological sorting with newest first
               return [newMsg, ...prev].sort(
                 (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
               )
             })
           } else if (payload.eventType === 'UPDATE') {
-            setMessages((prev) => {
-              const updatedMsg = payload.new as WhatsAppMessage
-              return prev.map((m) => (m.id === updatedMsg.id ? { ...m, ...updatedMsg } : m))
-            })
+            const updatedMsg = payload.new as WhatsAppMessage
+            if (updatedMsg.user_id !== tenantUserId) return
+            setMessages((prev) =>
+              prev.map((m) => (m.id === updatedMsg.id ? { ...m, ...updatedMsg } : m)),
+            )
           } else if (payload.eventType === 'DELETE') {
             setMessages((prev) => prev.filter((m) => m.id !== payload.old.id))
           }
         },
       )
-      .subscribe((status) => {
-        console.log('[useMessages] Subscription status:', status)
-      })
+      .subscribe()
 
     return () => {
-      console.log('[useMessages] Cleaning up subscription channel')
       supabase.removeChannel(channel)
     }
-  }, [user, contactId, fetchMessages])
+  }, [user, tenantUserId, organizationLoading, contactId, fetchMessages])
 
   return { messages, loading }
 }

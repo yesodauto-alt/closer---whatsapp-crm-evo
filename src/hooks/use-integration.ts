@@ -1,6 +1,7 @@
-import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react'
+import React, { createContext, useContext, useEffect, useRef, useState, ReactNode } from 'react'
 import { supabase } from '@/lib/supabase/client'
 import { useAuth } from './use-auth'
+import { useOrganization } from './use-organization'
 import { UserIntegration } from '@/lib/types'
 
 interface IntegrationContextType {
@@ -19,70 +20,103 @@ export const useIntegration = () => {
 
 export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
   const { user } = useAuth()
+  const { tenantUserId, loading: organizationLoading } = useOrganization()
   const [integration, setIntegration] = useState<UserIntegration | null>(null)
   const [loading, setLoading] = useState(true)
+  const contactSyncAttemptedRef = useRef<string | null>(null)
 
   useEffect(() => {
     if (!user) {
       setIntegration(null)
       setLoading(false)
+      contactSyncAttemptedRef.current = null
+      return
+    }
+
+    if (organizationLoading || !tenantUserId) {
+      setLoading(true)
       return
     }
 
     const fetchIntegration = async () => {
+      setLoading(true)
       const { data, error } = await supabase
         .from('user_integrations')
         .select('*')
-        .eq('user_id', user.id)
+        .eq('user_id', tenantUserId)
         .maybeSingle()
+
+      if (error) {
+        console.error('[useIntegration] Failed to load tenant integration:', error)
+        setIntegration(null)
+        setLoading(false)
+        return
+      }
 
       if (!data) {
         const newIntegration = {
-          user_id: user.id,
-          instance_name: user.id,
+          user_id: tenantUserId,
+          instance_name: tenantUserId,
           status: 'DISCONNECTED',
           is_setup_completed: false,
           is_webhook_enabled: false,
         }
-        const { data: inserted } = await supabase
+
+        const { data: inserted, error: insertError } = await supabase
           .from('user_integrations')
           .insert(newIntegration as any)
           .select()
           .single()
 
-        if (inserted) setIntegration(inserted as UserIntegration)
-      } else if (data.instance_name !== user.id) {
-        const { data: updated } = await supabase
+        if (insertError) {
+          console.error('[useIntegration] Failed to create tenant integration:', insertError)
+          setIntegration(null)
+        } else if (inserted) {
+          setIntegration(inserted as UserIntegration)
+        }
+      } else if (!data.instance_name) {
+        const { data: updated, error: updateError } = await supabase
           .from('user_integrations')
-          .update({ instance_name: user.id } as any)
+          .update({ instance_name: tenantUserId } as any)
           .eq('id', data.id)
           .select()
           .single()
 
-        if (updated) setIntegration(updated as UserIntegration)
+        if (updateError) {
+          console.error('[useIntegration] Failed to repair tenant instance name:', updateError)
+          setIntegration(data as UserIntegration)
+        } else if (updated) {
+          setIntegration(updated as UserIntegration)
+        }
       } else {
         setIntegration(data as UserIntegration)
       }
+
       setLoading(false)
     }
 
     fetchIntegration()
 
     const channel = supabase
-      .channel('integration_changes')
+      .channel(`integration_changes_${tenantUserId}`)
       .on(
         'postgres_changes',
         {
           event: '*',
           schema: 'public',
           table: 'user_integrations',
-          filter: `user_id=eq.${user.id}`,
+          filter: `user_id=eq.${tenantUserId}`,
         },
         (payload) => {
-          setIntegration((prev) => {
-            // Merge with previous to prevent wiping optimistic local UI updates (like base64 fetch)
-            return { ...(prev || {}), ...(payload.new as UserIntegration) }
-          })
+          if (payload.eventType === 'DELETE') {
+            setIntegration(null)
+            contactSyncAttemptedRef.current = null
+            return
+          }
+          setIntegration((prev) => ({
+            ...(prev || {}),
+            ...(payload.new as UserIntegration),
+          }))
         },
       )
       .subscribe()
@@ -90,7 +124,30 @@ export const IntegrationProvider = ({ children }: { children: ReactNode }) => {
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [user])
+  }, [user, tenantUserId, organizationLoading])
+
+  useEffect(() => {
+    if (!integration?.id || integration.status !== 'CONNECTED') return
+    if (contactSyncAttemptedRef.current === integration.id) return
+
+    contactSyncAttemptedRef.current = integration.id
+
+    void supabase.functions.invoke('evolution-sync-contacts').then(({ data, error }) => {
+      if (error || data?.error) {
+        console.error(
+          '[useIntegration] Automatic Evolution contact sync failed:',
+          error?.message || data?.error,
+        )
+        return
+      }
+
+      console.info('[useIntegration] Evolution contacts synchronized:', {
+        synced: data?.synced ?? 0,
+        total: data?.total ?? 0,
+        webhookConfigured: data?.webhookConfigured ?? false,
+      })
+    })
+  }, [integration?.id, integration?.status])
 
   return React.createElement(
     IntegrationContext.Provider,

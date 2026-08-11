@@ -40,6 +40,7 @@ export interface OrganizationMembership {
     id: string
     name: string
     slug: string
+    owner_user_id: string
   }
 }
 

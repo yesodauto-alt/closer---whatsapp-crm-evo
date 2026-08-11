@@ -4,9 +4,7 @@ import { evolutionFetch, jsonResponse, errorResponse } from '../_shared/evolutio
 import { createServiceClient, resolveIntegration } from '../_shared/integration.ts'
 
 Deno.serve(async (req: Request) => {
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders })
-  }
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
     const { user, integration } = await resolveIntegration(req)
@@ -14,14 +12,12 @@ Deno.serve(async (req: Request) => {
     if (!integration.instance_name) return errorResponse('Integration has no instance_name', 400)
 
     const instanceName = integration.instance_name
+    const { data, error, status } = await evolutionFetch(
+      `/instance/logout/${encodeURIComponent(instanceName)}`,
+      { method: 'DELETE' },
+    )
 
-    const { data, error, status } = await evolutionFetch(`/instance/logout/${instanceName}`, {
-      method: 'DELETE',
-    })
-
-    if (error) {
-      return errorResponse(error, status)
-    }
+    if (error) return errorResponse(error, status)
 
     const db = createServiceClient()
     await db
@@ -31,10 +27,10 @@ Deno.serve(async (req: Request) => {
         is_setup_completed: false,
         updated_at: new Date().toISOString(),
       })
-      .eq('user_id', user.id)
+      .eq('id', integration.id)
 
     return jsonResponse({ success: true, data })
   } catch (err) {
-    return errorResponse(err.message || 'Internal server error', 500)
+    return errorResponse(err instanceof Error ? err.message : 'Internal server error', 500)
   }
 })
