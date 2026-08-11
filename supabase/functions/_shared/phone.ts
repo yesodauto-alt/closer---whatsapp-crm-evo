@@ -1,24 +1,30 @@
-// Single source of truth for Brazilian phone normalization.
-// Keeps two concepts separate:
-//   - remote_jid   = original WhatsApp identifier (never modified)
+// Single source of truth for WhatsApp/Brazilian phone identity.
+// Keeps three concepts separate:
+//   - remote_jid   = canonical phone-based WhatsApp JID when known
+//   - lid_jid      = WhatsApp Linked ID (@lid), never displayed as a phone number
 //   - phone_number = canonical digits only (no formatting, no @s.whatsapp.net)
 
 export function onlyDigits(input: string): string {
   return (input ?? '').replace(/\D/g, '')
 }
 
-// Extract digits from a direct WhatsApp JID: "5511999999999@s.whatsapp.net" -> "5511999999999".
-// Returns "" when the JID is not a direct number (e.g. "@g.us", "@lid", "status@broadcast").
+export function isLidJid(jid: string | null | undefined): boolean {
+  return String(jid ?? '').trim().endsWith('@lid')
+}
+
+export function isPhoneJid(jid: string | null | undefined): boolean {
+  const value = String(jid ?? '').trim()
+  return /^\d+@s\.whatsapp\.net$/.test(value)
+}
+
+// Extract digits only from a phone-based direct WhatsApp JID.
 export function digitsFromJid(jid: string): string {
   const jidStr = (jid ?? '').trim()
-  const before = jidStr.split('@')[0]
-  if (!/^\d+$/.test(before)) return ''
-  if (jidStr.includes('@') && !jidStr.endsWith('@s.whatsapp.net')) return ''
-  return before
+  if (!isPhoneJid(jidStr)) return ''
+  return jidStr.split('@')[0]
 }
 
 // Normalize a Brazilian phone entry into canonical digits (no formatting).
-// Handles: "+55 11 99999-9999", "5511999999999", "11 99999-9999", "(11) 99999-9999", "11999999999".
 // Rules:
 //   - strip formatting, keep digits only
 //   - recognize BR country code 55; never duplicate it
@@ -35,8 +41,48 @@ export function normalizeBrazilianPhone(input: string): string {
   return digits
 }
 
-// Resolve the number to send to the Evolution API, preferring the authoritative JID digits
-// and falling back to the normalized phone_number.
+export interface WhatsAppIdentity {
+  remoteJid: string
+  lidJid: string | null
+  phoneNumber: string | null
+}
+
+// Resolve LID + alternate JID pairs emitted by newer WhatsApp/Baileys/Evolution versions.
+// Example:
+//   primaryJid   = 13391741591767@lid
+//   alternateJid = 5511934136614@s.whatsapp.net
+// Result:
+//   remoteJid    = 5511934136614@s.whatsapp.net
+//   lidJid       = 13391741591767@lid
+//   phoneNumber  = 5511934136614
+export function resolveWhatsAppIdentity(
+  primaryJid: string | null | undefined,
+  alternateJid?: string | null,
+  rawNumber?: string | null,
+): WhatsAppIdentity {
+  const primary = String(primaryJid ?? '').trim()
+  const alternate = String(alternateJid ?? '').trim()
+
+  const phoneJid = [primary, alternate].find(isPhoneJid) || ''
+  const lidJid = [primary, alternate].find(isLidJid) || null
+  const numberFromJid = phoneJid ? digitsFromJid(phoneJid) : ''
+  const numberFromField = normalizeBrazilianPhone(String(rawNumber ?? ''))
+  const phoneNumber = numberFromJid || numberFromField || null
+
+  const canonicalJid =
+    phoneJid ||
+    (phoneNumber ? `${phoneNumber}@s.whatsapp.net` : '') ||
+    primary ||
+    alternate
+
+  return {
+    remoteJid: canonicalJid,
+    lidJid,
+    phoneNumber,
+  }
+}
+
+// Resolve the number to send to the Evolution API, never treating @lid digits as a phone.
 export function resolveEvolutionNumber(
   remoteJid: string | null | undefined,
   phoneNumber: string | null | undefined,
