@@ -90,26 +90,59 @@ export async function resolveTenant(userId: string) {
   }
 }
 
+type IntegrationSelector = {
+  integrationId?: string | null
+  channelId?: string | null
+}
+
+export async function getIntegrationForTenant(userId: string, selector: IntegrationSelector = {}) {
+  const db = createServiceClient()
+  let query = db.from('user_integrations').select('*').eq('user_id', userId)
+
+  if (selector.integrationId) {
+    query = query.eq('id', selector.integrationId)
+  } else if (selector.channelId) {
+    query = query.eq('channel_id', selector.channelId)
+  } else {
+    query = query
+      .order('is_primary', { ascending: false })
+      .order('created_at', { ascending: true })
+  }
+
+  const { data, error } = await query.limit(1).maybeSingle()
+  if (error) throw new Error(error.message)
+  return data
+}
+
 export async function getIntegrationByUserId(userId: string) {
+  return getIntegrationForTenant(userId)
+}
+
+export async function getChannelForOrganization(organizationId: string, channelId: string) {
   const db = createServiceClient()
   const { data, error } = await db
-    .from('user_integrations')
+    .from('channels')
     .select('*')
-    .eq('user_id', userId)
+    .eq('id', channelId)
+    .eq('organization_id', organizationId)
     .maybeSingle()
   if (error) throw new Error(error.message)
   return data
 }
 
-export async function resolveIntegration(req: Request) {
+export async function resolveIntegration(req: Request, selector: IntegrationSelector = {}) {
   const user = await getAuthUser(req)
   if (!user) {
     return { user: null, integration: null, tenantUserId: null, organizationId: null }
   }
 
   const { tenantUserId, organizationId } = await resolveTenant(user.id)
-  const integration = await getIntegrationByUserId(tenantUserId)
+  const integration = await getIntegrationForTenant(tenantUserId, selector)
   return { user, integration, tenantUserId, organizationId }
+}
+
+export function buildChannelInstanceName(channelId: string) {
+  return `yesod-${channelId}`
 }
 
 /**
@@ -135,8 +168,6 @@ export async function ensureFullHistoryConfigured(instanceName: string) {
     return { configured: true, changed: false, status: 200, error: null }
   }
 
-  // SettingsDto fields are optional. Change only this flag so existing call,
-  // presence, read-receipt and other tenant settings are never reset.
   const update = await evolutionFetch(`/settings/set/${encoded}`, {
     method: 'POST',
     body: { syncFullHistory: true },
