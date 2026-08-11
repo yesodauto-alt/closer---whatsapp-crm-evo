@@ -29,6 +29,15 @@ export interface Channel {
   updated_at: string
 }
 
+export interface PriorityCategory {
+  code: string
+  label: string
+  minScore: number
+  color?: string
+}
+
+export type ConversationSort = 'priority' | 'recent' | 'oldest'
+
 export interface AIAgent {
   id: string
   user_id: string
@@ -45,6 +54,9 @@ export interface AIAgent {
   restrictions: string | null
   knowledge_base_enabled: boolean
   team_id: string | null
+  triage_enabled: boolean
+  triage_instructions: string | null
+  triage_history_limit: number
   is_active: boolean
   created_at: string
   updated_at: string
@@ -97,6 +109,9 @@ export interface WhatsAppContact {
   ai_analysis_summary: string | null
   ai_agent_id: string | null
   pipeline_stage?: string | null
+  is_address_book?: boolean
+  has_conversation?: boolean
+  classification_updated_at?: string | null
   created_at: string
 }
 

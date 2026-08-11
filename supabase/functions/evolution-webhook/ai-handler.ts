@@ -1,4 +1,5 @@
 import type { SupabaseClient } from 'npm:@supabase/supabase-js@2'
+import { triageContact } from '../_shared/triage.ts'
 
 interface Contact {
   id: string
@@ -9,6 +10,19 @@ interface Contact {
   phone_number: string | null
 }
 
+function scheduleTriage(supabase: SupabaseClient, contactId: string) {
+  const task = triageContact(supabase, contactId).catch((err) => {
+    console.error('[ai-handler] Background triage failed', {
+      contactId,
+      error: err instanceof Error ? err.message : String(err),
+    })
+  })
+
+  const edgeRuntime = (globalThis as any).EdgeRuntime
+  if (edgeRuntime?.waitUntil) edgeRuntime.waitUntil(task)
+  else void task
+}
+
 export async function handleMessageUpsert(
   supabase: SupabaseClient,
   userId: string,
@@ -16,6 +30,11 @@ export async function handleMessageUpsert(
   text: string,
   instanceName: string,
 ): Promise<void> {
+  // Triage is independent from the customer-facing responder. An internal agent
+  // can classify every inbound conversation even when no reply agent is assigned
+  // to the contact. It runs in the background so webhook latency is unaffected.
+  scheduleTriage(supabase, contact.id)
+
   if (!contact.ai_agent_id) return
 
   const { data: agent } = await supabase
@@ -39,7 +58,7 @@ export async function handleMessageUpsert(
         body: JSON.stringify({
           agentId: agent.id,
           contactId: contact.id,
-          message: text,
+          input: text,
           instanceName,
           phoneNumber: contact.phone_number || contact.remote_jid.split('@')[0],
         }),
@@ -50,6 +69,6 @@ export async function handleMessageUpsert(
       console.error('AI agent response failed:', response.status)
     }
   } catch (err) {
-    console.error('Error invoking AI agent:', err.message)
+    console.error('Error invoking AI agent:', err instanceof Error ? err.message : String(err))
   }
 }
