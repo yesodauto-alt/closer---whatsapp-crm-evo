@@ -152,12 +152,11 @@ where c.integration_id is null
   and ui.is_primary = true;
 
 update public.whatsapp_messages m
-set integration_id = coalesce(c.integration_id, ui.id)
-from public.whatsapp_contacts c
-left join public.user_integrations ui
-  on ui.user_id = m.user_id and ui.is_primary = true
-where m.integration_id is null
-  and c.id = m.contact_id;
+set integration_id = coalesce(
+  (select c.integration_id from public.whatsapp_contacts c where c.id = m.contact_id),
+  (select ui.id from public.user_integrations ui where ui.user_id = m.user_id and ui.is_primary = true order by ui.created_at asc limit 1)
+)
+where m.integration_id is null;
 
 -- New conflict targets used by multichannel-aware Edge Functions. Legacy unique
 -- constraints remain until phase 2 so the currently deployed functions keep working.
