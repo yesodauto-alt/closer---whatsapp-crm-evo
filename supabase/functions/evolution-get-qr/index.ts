@@ -46,13 +46,19 @@ Deno.serve(async (req: Request) => {
     const instanceName = integration.instance_name
     const ensured = await ensureInstanceExists(instanceName)
     if (ensured.error) {
-      return jsonResponse({ success: true, connected: false, creating: true, error: ensured.error })
+      return jsonResponse({
+        success: false,
+        connected: false,
+        creating: true,
+        error: 'instance_lookup_failed',
+        evolutionStatus: ensured.status,
+        evolutionError: ensured.error,
+      })
     }
 
     // Secondary instances created by this CRM are always created with
     // syncFullHistory:true. A second settings probe is not required to obtain
-    // the QR and is incompatible with some Evolution builds, which return 400
-    // from /settings even while the instance itself is healthy and connecting.
+    // the QR and is incompatible with some Evolution builds.
     let fullHistoryConfigured = ensured.created || instanceName.startsWith('yesod-')
     let fullHistoryWarning: string | null = null
 
@@ -69,16 +75,36 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    const webhook = await ensureWebhookConfigured(instanceName)
-    if (!webhook.configured) {
-      return errorResponse(webhook.error || 'Evolution webhook could not be configured', webhook.status || 502)
-    }
-
     const db = createServiceClient()
     const now = new Date().toISOString()
+
+    // Do not POST /webhook/set on every QR poll. Evolution builds can return
+    // HTTP 400 when an already-configured webhook is set again. The channel
+    // record is the source of truth for whether initial webhook setup succeeded.
+    let webhookConfigured = Boolean(integration.is_webhook_enabled)
+    let webhookWarning: string | null = null
+
+    if (!webhookConfigured) {
+      const webhook = await ensureWebhookConfigured(instanceName)
+      webhookConfigured = webhook.configured
+      webhookWarning = webhook.configured ? null : webhook.error
+
+      if (!webhookConfigured) {
+        console.warn('[evolution-get-qr] Webhook setup failed; QR generation will continue', {
+          instanceName,
+          status: webhook.status,
+          error: webhook.error,
+        })
+      }
+    }
+
     await db
       .from('user_integrations')
-      .update({ is_webhook_enabled: true, is_setup_completed: true, updated_at: now })
+      .update({
+        is_webhook_enabled: webhookConfigured,
+        is_setup_completed: true,
+        updated_at: now,
+      })
       .eq('id', integration.id)
 
     const { data, error, status } = await evolutionFetch(
@@ -124,14 +150,30 @@ Deno.serve(async (req: Request) => {
           connectionState: normalizedState || null,
           fullHistoryConfigured,
           fullHistoryWarning,
-          webhookConfigured: true,
+          webhookConfigured,
+          webhookWarning,
         })
       }
 
-      return errorResponse(
-        `Evolution connect failed (${status}): ${error}${normalizedState ? ` [state=${normalizedState}]` : ''}`,
-        status || 502,
-      )
+      // Return HTTP 200 with structured diagnostic data so the Supabase SDK does
+      // not collapse the real Evolution error into "Edge Function returned a
+      // non-2xx status code".
+      return jsonResponse({
+        success: false,
+        integrationId: integration.id,
+        channelId: integration.channel_id,
+        connected: false,
+        creating: false,
+        error: 'evolution_connect_failed',
+        evolutionStatus: status,
+        evolutionError: error,
+        connectionState: normalizedState || null,
+        stateLookupError: stateResult.error,
+        fullHistoryConfigured,
+        fullHistoryWarning,
+        webhookConfigured,
+        webhookWarning,
+      })
     }
 
     const qr = normalizeQR(data)
@@ -157,7 +199,8 @@ Deno.serve(async (req: Request) => {
         base64: null,
         fullHistoryConfigured,
         fullHistoryWarning,
-        webhookConfigured: true,
+        webhookConfigured,
+        webhookWarning,
       })
     }
 
@@ -183,7 +226,8 @@ Deno.serve(async (req: Request) => {
         base64: qr.base64,
         fullHistoryConfigured,
         fullHistoryWarning,
-        webhookConfigured: true,
+        webhookConfigured,
+        webhookWarning,
       })
     }
 
@@ -201,7 +245,8 @@ Deno.serve(async (req: Request) => {
       qrCount: (data as any)?.count ?? (data as any)?.qrcode?.count ?? null,
       fullHistoryConfigured,
       fullHistoryWarning,
-      webhookConfigured: true,
+      webhookConfigured,
+      webhookWarning,
     })
   } catch (err) {
     console.error('[evolution-get-qr] Unhandled error', err)
