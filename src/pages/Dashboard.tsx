@@ -117,13 +117,6 @@ export default function Dashboard() {
       if (messagesData?.error) throw new Error(messagesData.error)
       if (messagesData?.job_id) await pollJob(messagesData.job_id, 'messages')
 
-      setSyncProgress({ type: 'ai', total: 0, processed: 0, status: 'running' })
-      const { data: aiData, error: aiError } =
-        await supabase.functions.invoke('ai-classify-contacts')
-      if (aiError) throw aiError
-      if (aiData?.error) throw new Error(aiData.error)
-      if (aiData?.job_id) await pollJob(aiData.job_id, 'ai')
-
       toast.success(t('sync_completed'))
     } catch (error: any) {
       console.error('Sync failed:', error)
@@ -196,9 +189,7 @@ export default function Dashboard() {
                 </div>
                 {syncProgress.type === 'contacts'
                   ? t('syncing_contacts')
-                  : syncProgress.type === 'messages'
-                    ? t('syncing_messages')
-                    : t('running_ai')}
+                  : t('syncing_messages')}
               </span>
               <span className="text-muted-foreground font-semibold">
                 {syncProgress.total > 0
