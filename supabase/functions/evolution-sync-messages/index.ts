@@ -31,8 +31,8 @@ Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
-    const { user, integration } = await resolveIntegration(req)
-    if (!user || !integration) return errorResponse('Unauthorized', 401)
+    const { user, integration, tenantUserId } = await resolveIntegration(req)
+    if (!user || !integration || !tenantUserId) return errorResponse('Unauthorized', 401)
     if (!integration.instance_name) return errorResponse('Integration has no instance_name', 400)
 
     const instanceName = integration.instance_name
@@ -73,7 +73,7 @@ Deno.serve(async (req: Request) => {
       let { data: contact } = await db
         .from('whatsapp_contacts')
         .select('*')
-        .eq('user_id', user.id)
+        .eq('user_id', tenantUserId)
         .eq('remote_jid', jid)
         .maybeSingle()
 
@@ -81,7 +81,7 @@ Deno.serve(async (req: Request) => {
         const { data: created, error: createError } = await db
           .from('whatsapp_contacts')
           .insert({
-            user_id: user.id,
+            user_id: tenantUserId,
             remote_jid: jid,
             phone_number: digitsFromJid(jid) || null,
             last_message_at: new Date().toISOString(),
@@ -125,14 +125,13 @@ Deno.serve(async (req: Request) => {
         const timestamp = msg?.messageTimestamp
           ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
           : new Date().toISOString()
-
         if (!latestTimestamp || timestamp > latestTimestamp) latestTimestamp = timestamp
 
         const { error: upsertError } = await db
           .from('whatsapp_messages')
           .upsert(
             {
-              user_id: user.id,
+              user_id: tenantUserId,
               contact_id: contact.id,
               message_id: messageId,
               from_me: msg?.key?.fromMe ?? false,
@@ -144,11 +143,8 @@ Deno.serve(async (req: Request) => {
             { onConflict: 'user_id,message_id' },
           )
 
-        if (upsertError) {
-          errors.push({ remoteJid: jid, error: upsertError.message })
-        } else {
-          synced++
-        }
+        if (upsertError) errors.push({ remoteJid: jid, error: upsertError.message })
+        else synced++
       }
 
       if (latestTimestamp) {
