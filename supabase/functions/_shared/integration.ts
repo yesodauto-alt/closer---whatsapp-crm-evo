@@ -145,39 +145,77 @@ export function buildChannelInstanceName(channelId: string) {
   return `yesod-${channelId}`
 }
 
-/**
- * Full-history sync must be enabled before the QR is scanned. Evolution/Baileys
- * receives the account's historical chats, contacts and messages during the
- * WhatsApp history synchronization window, so pairing without this setting can
- * leave an existing account only partially represented in the CRM.
- */
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
 export async function ensureFullHistoryConfigured(instanceName: string) {
   const encoded = encodeURIComponent(instanceName)
-  const current = await evolutionFetch(`/settings/find/${encoded}`, { method: 'GET' })
-  if (current.error) {
+  let current: Awaited<ReturnType<typeof evolutionFetch>> | null = null
+
+  // A freshly-created Baileys instance can exist in fetchInstances before its
+  // settings row is readable. Treat 400/404 during this short window as
+  // eventual consistency, not as a fatal QR failure.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    current = await evolutionFetch(`/settings/find/${encoded}`, { method: 'GET' })
+    if (!current.error) break
+    if (![400, 404].includes(current.status)) break
+    await sleep(700 + attempt * 300)
+  }
+
+  if (!current || current.error) {
     return {
       configured: false,
       changed: false,
-      status: current.status,
-      error: `Failed to read Evolution settings: ${current.error}`,
+      status: current?.status ?? 502,
+      error: `Failed to read Evolution settings: ${current?.error ?? 'unknown error'}`,
     }
   }
 
-  const currentSettings = current.data?.settings ?? current.data ?? {}
-  if (currentSettings?.syncFullHistory === true) {
+  const currentSettings = (current.data as any)?.settings ?? current.data ?? {}
+  if ((currentSettings as any)?.syncFullHistory === true) {
     return { configured: true, changed: false, status: 200, error: null }
+  }
+
+  // Some Evolution releases validate the full settings DTO and reject a
+  // partial body such as { syncFullHistory: true } with HTTP 400. Preserve the
+  // instance's current settings and only flip the history flag.
+  const updateBody = {
+    rejectCall: Boolean((currentSettings as any)?.rejectCall),
+    msgCall: String((currentSettings as any)?.msgCall ?? ''),
+    groupsIgnore: Boolean((currentSettings as any)?.groupsIgnore),
+    alwaysOnline: Boolean((currentSettings as any)?.alwaysOnline),
+    readMessages: Boolean((currentSettings as any)?.readMessages),
+    readStatus: Boolean((currentSettings as any)?.readStatus),
+    syncFullHistory: true,
+    wavoipToken: String((currentSettings as any)?.wavoipToken ?? ''),
   }
 
   const update = await evolutionFetch(`/settings/set/${encoded}`, {
     method: 'POST',
-    body: { syncFullHistory: true },
+    body: updateBody,
   })
 
+  if (update.error) {
+    return {
+      configured: false,
+      changed: false,
+      status: update.status,
+      error: `Failed to enable full history sync: ${update.error}`,
+    }
+  }
+
+  // Verify persistence so the user never scans a QR with history sync silently
+  // disabled.
+  const verified = await evolutionFetch(`/settings/find/${encoded}`, { method: 'GET' })
+  const verifiedSettings = (verified.data as any)?.settings ?? verified.data ?? {}
+  const configured = !verified.error && (verifiedSettings as any)?.syncFullHistory === true
+
   return {
-    configured: !update.error,
-    changed: !update.error,
-    status: update.status,
-    error: update.error ? `Failed to enable full history sync: ${update.error}` : null,
+    configured,
+    changed: configured,
+    status: configured ? 200 : verified.status,
+    error: configured
+      ? null
+      : `Evolution did not persist syncFullHistory=true${verified.error ? `: ${verified.error}` : ''}`,
   }
 }
 

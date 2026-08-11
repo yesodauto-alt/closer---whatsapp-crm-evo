@@ -98,9 +98,25 @@ Deno.serve(async (req: Request) => {
     const ensured = await ensureInstanceExists(instanceName)
     if (ensured.error) return errorResponse(ensured.error, ensured.status)
 
-    const history = await ensureFullHistoryConfigured(instanceName)
-    if (!history.configured) {
-      return errorResponse(history.error || 'Full history sync could not be enabled', history.status || 502)
+    // Every secondary channel created by this CRM uses the yesod- prefix and is
+    // created with syncFullHistory:true in ensureInstanceExists. Do not block QR
+    // generation on a second /settings call: several Evolution releases return
+    // HTTP 400 for that redundant settings probe even though the instance was
+    // created correctly with full-history enabled.
+    let fullHistoryConfigured = ensured.created || instanceName.startsWith('yesod-')
+    let fullHistoryWarning: string | null = null
+
+    if (!fullHistoryConfigured) {
+      const history = await ensureFullHistoryConfigured(instanceName)
+      fullHistoryConfigured = history.configured
+      fullHistoryWarning = history.configured ? null : history.error
+      if (fullHistoryWarning) {
+        console.warn('[evolution-create-instance] Full-history settings probe failed; QR flow will continue', {
+          instanceName,
+          status: history.status,
+          error: fullHistoryWarning,
+        })
+      }
     }
 
     const webhook = await ensureWebhookConfigured(instanceName)
@@ -135,8 +151,8 @@ Deno.serve(async (req: Request) => {
       instanceName,
       created: ensured.created,
       data: ensured.data,
-      fullHistoryConfigured: history.configured,
-      fullHistoryChanged: history.changed,
+      fullHistoryConfigured,
+      fullHistoryWarning,
       webhookConfigured: true,
     })
   } catch (err) {
