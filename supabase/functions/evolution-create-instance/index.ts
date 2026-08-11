@@ -12,11 +12,10 @@ Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
-    const { user, integration } = await resolveIntegration(req)
-    if (!user) return errorResponse('Unauthorized', 401)
+    const { user, integration, tenantUserId } = await resolveIntegration(req)
+    if (!user || !tenantUserId) return errorResponse('Unauthorized', 401)
 
-    const instanceName = integration?.instance_name || user.id
-
+    const instanceName = integration?.instance_name || tenantUserId
     const ensured = await ensureInstanceExists(instanceName)
     if (ensured.error) return errorResponse(ensured.error, ensured.status)
 
@@ -25,7 +24,7 @@ Deno.serve(async (req: Request) => {
     const { data: existing } = await db
       .from('user_integrations')
       .select('id')
-      .eq('user_id', user.id)
+      .eq('user_id', tenantUserId)
       .maybeSingle()
 
     const patch = {
@@ -39,7 +38,7 @@ Deno.serve(async (req: Request) => {
     if (existing) {
       await db.from('user_integrations').update(patch).eq('id', existing.id)
     } else {
-      await db.from('user_integrations').insert({ user_id: user.id, ...patch })
+      await db.from('user_integrations').insert({ user_id: tenantUserId, ...patch })
     }
 
     return jsonResponse({
