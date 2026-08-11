@@ -12,24 +12,20 @@ Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
-    const { user, integration } = await resolveIntegration(req)
-    if (!user || !integration) return errorResponse('Unauthorized', 401)
+    const { user, integration, tenantUserId } = await resolveIntegration(req)
+    if (!user || !integration || !tenantUserId) return errorResponse('Unauthorized', 401)
     if (!integration.instance_name) return errorResponse('Integration has no instance_name', 400)
 
     const instanceName = integration.instance_name
-
-    // Keep the instance webhook aligned even for integrations created by older builds.
     const webhook = await ensureWebhookConfigured(instanceName)
 
-    const { data, error, status } = await evolutionFetch(`/chat/findContacts/${encodeURIComponent(instanceName)}`, {
-      method: 'POST',
-      body: {
-        where: {},
-        take: 5000,
-        skip: 0,
-        orderBy: {},
+    const { data, error, status } = await evolutionFetch(
+      `/chat/findContacts/${encodeURIComponent(instanceName)}`,
+      {
+        method: 'POST',
+        body: { where: {}, take: 5000, skip: 0, orderBy: {} },
       },
-    })
+    )
 
     if (error) return errorResponse(error, status)
 
@@ -55,9 +51,8 @@ Deno.serve(async (req: Request) => {
 
       const rawNumber = String(contact?.number || '')
       const canonicalPhone = normalizeBrazilianPhone(rawNumber) || digitsFromJid(remoteJid)
-
       const row: Record<string, unknown> = {
-        user_id: user.id,
+        user_id: tenantUserId,
         remote_jid: remoteJid,
         phone_number: canonicalPhone || null,
       }
@@ -71,11 +66,8 @@ Deno.serve(async (req: Request) => {
         .from('whatsapp_contacts')
         .upsert(row, { onConflict: 'user_id,remote_jid' })
 
-      if (upsertError) {
-        errors.push({ remoteJid, error: upsertError.message })
-      } else {
-        synced++
-      }
+      if (upsertError) errors.push({ remoteJid, error: upsertError.message })
+      else synced++
     }
 
     await db
