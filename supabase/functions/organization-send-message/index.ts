@@ -3,7 +3,9 @@ import { resolveEvolutionNumber } from '../_shared/phone.ts'
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers':
+    'authorization, x-client-info, x-supabase-client-platform, apikey, content-type',
 }
 
 const json = (body: unknown, status = 200) =>
@@ -19,26 +21,29 @@ Deno.serve(async (request) => {
   const supabaseUrl = Deno.env.get('SUPABASE_URL')
   const anonKey = Deno.env.get('SUPABASE_ANON_KEY')
   const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
-  const authorization = request.headers.get('Authorization')
-  if (!supabaseUrl || !anonKey || !serviceRoleKey || !authorization) {
+  const authorization = request.headers.get('Authorization') || ''
+  const token = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || ''
+
+  if (!supabaseUrl || !anonKey || !serviceRoleKey || !token) {
     return json({ error: 'Unauthorized' }, 401)
   }
 
   const userDb = createClient(supabaseUrl, anonKey, {
-    global: { headers: { Authorization: authorization } },
+    global: { headers: { Authorization: `Bearer ${token}` } },
   })
+
   const {
     data: { user },
-  } = await userDb.auth.getUser()
-  if (!user) return json({ error: 'Unauthorized' }, 401)
+    error: userError,
+  } = await userDb.auth.getUser(token)
+  if (userError || !user) return json({ error: 'Unauthorized' }, 401)
 
   const body = await request.json().catch(() => ({}))
   const contactId = String(body.contactId || '')
   const text = String(body.text || '').trim()
   if (!contactId || !text) return json({ error: 'contactId e text são obrigatórios' }, 400)
 
-  // This read is intentionally performed with the caller JWT. RLS proves that
-  // the user owns the contact or belongs to the assigned team.
+  // RLS validates that the authenticated user may access this contact.
   const { data: allowedContact, error: accessError } = await userDb
     .from('whatsapp_contacts')
     .select('id')
@@ -67,27 +72,41 @@ Deno.serve(async (request) => {
     ''
   ).replace(/\/$/, '')
   const evolutionKey = integration.evolution_api_key || Deno.env.get('EVOLUTION_API_KEY')
+  const number = resolveEvolutionNumber(contact.remote_jid, contact.phone_number)
+
   if (!evolutionUrl || !evolutionKey || !integration.instance_name) {
     return json({ error: 'Evolution não configurada' }, 503)
   }
+  if (!number) return json({ error: 'Contato sem número válido para envio' }, 400)
 
   const response = await fetch(
     `${evolutionUrl}/message/sendText/${encodeURIComponent(integration.instance_name)}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', apikey: evolutionKey },
-      body: JSON.stringify({ number: resolveEvolutionNumber(contact.remote_jid, contact.phone_number), text }),
+      body: JSON.stringify({
+        number,
+        textMessage: { text },
+      }),
     },
   )
-  const payload = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    return json(
-      { error: payload?.message || payload?.error || `Evolution HTTP ${response.status}` },
-      502,
-    )
+
+  const responseText = await response.text()
+  let payload: any = {}
+  try {
+    payload = responseText ? JSON.parse(responseText) : {}
+  } catch {
+    payload = { raw: responseText }
   }
 
-  const messageId = payload?.key?.id || payload?.message?.key?.id || crypto.randomUUID()
+  if (!response.ok) {
+    const evolutionError =
+      payload?.message || payload?.error || payload?.response?.message || `Evolution HTTP ${response.status}`
+    return json({ error: evolutionError, evolutionStatus: response.status }, 502)
+  }
+
+  const messageId = payload?.key?.id || payload?.message?.key?.id || payload?.id || crypto.randomUUID()
+  const timestamp = new Date().toISOString()
   const { error: messageError } = await adminDb.from('whatsapp_messages').upsert(
     {
       user_id: contact.user_id,
@@ -96,12 +115,17 @@ Deno.serve(async (request) => {
       from_me: true,
       text,
       type: 'conversation',
-      timestamp: new Date().toISOString(),
+      timestamp,
       raw: payload,
     },
     { onConflict: 'user_id,message_id' },
   )
   if (messageError) return json({ error: messageError.message }, 500)
+
+  await adminDb
+    .from('whatsapp_contacts')
+    .update({ last_message_at: timestamp })
+    .eq('id', contact.id)
 
   return json({ success: true, messageId })
 })
