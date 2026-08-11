@@ -2,10 +2,59 @@ import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { corsHeaders } from '../_shared/cors.ts'
 import { evolutionFetch, jsonResponse, errorResponse } from '../_shared/evolution-api.ts'
 import { createServiceClient, resolveIntegration } from '../_shared/integration.ts'
-import { digitsFromJid } from '../_shared/phone.ts'
+import {
+  isLidJid,
+  isPhoneJid,
+  resolveWhatsAppIdentity,
+  type WhatsAppIdentity,
+} from '../_shared/phone.ts'
 
-function directJid(jid: string) {
-  return Boolean(jid) && !jid.includes('@g.us') && !jid.includes('@lid') && !jid.includes('status@broadcast')
+function isSupportedDirectJid(jid: string) {
+  const value = String(jid ?? '').trim()
+  return isPhoneJid(value) || (/^\d{6,20}@lid$/.test(value) && isLidJid(value))
+}
+
+function firstWhatsAppJid(chat: any): string {
+  const candidates = [
+    chat?.remoteJid,
+    chat?.jid,
+    chat?.lastMessage?.key?.remoteJid,
+    chat?.id,
+  ]
+  for (const candidate of candidates) {
+    const value = String(candidate ?? '').trim()
+    if (isSupportedDirectJid(value)) return value
+  }
+  return ''
+}
+
+function alternateWhatsAppJid(chat: any): string {
+  const candidates = [
+    chat?.remoteJidAlt,
+    chat?.jidAlt,
+    chat?.lastMessage?.key?.remoteJidAlt,
+  ]
+  for (const candidate of candidates) {
+    const value = String(candidate ?? '').trim()
+    if (isSupportedDirectJid(value)) return value
+  }
+  return ''
+}
+
+function cleanPushName(value: unknown, identity: WhatsAppIdentity): string | null | undefined {
+  if (value === undefined) return undefined
+  const name = String(value ?? '').trim()
+  if (!name) return null
+  const lidDigits = identity.lidJid?.split('@')[0] || ''
+  if (
+    name === lidDigits ||
+    name === identity.phoneNumber ||
+    name === '0' ||
+    name.toLowerCase() === 'você'
+  ) {
+    return null
+  }
+  return name
 }
 
 function extractMessages(data: any): any[] {
@@ -27,6 +76,23 @@ function getText(msg: any) {
   )
 }
 
+function messageTimestamp(msg: any): string {
+  const raw = msg?.messageTimestamp ?? msg?.timestamp
+  if (!raw) return new Date().toISOString()
+  const numeric = Number(raw)
+  const date = Number.isFinite(numeric) && numeric > 0
+    ? new Date(numeric < 10_000_000_000 ? numeric * 1000 : numeric)
+    : new Date(raw)
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString()
+}
+
+type TargetChat = {
+  queryJid: string
+  identity: WhatsAppIdentity
+  pushName?: string | null
+  profilePictureUrl?: string | null
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
@@ -37,12 +103,24 @@ Deno.serve(async (req: Request) => {
 
     const instanceName = integration.instance_name
     const body = await req.json().catch(() => ({}))
-    const remoteJid: string | undefined = body?.remoteJid
-    const limit = Math.min(Math.max(Number(body?.limit) || 100, 1), 500)
+    const requestedJid = String(body?.remoteJid ?? '').trim()
+    const limit = Math.min(Math.max(Number(body?.limit) || 100, 1), 300)
 
-    let targetJids: string[] = []
-    if (remoteJid) {
-      targetJids = [remoteJid]
+    const targets: TargetChat[] = []
+    let rejectedInternalIds = 0
+
+    if (requestedJid) {
+      if (!isSupportedDirectJid(requestedJid)) {
+        return errorResponse('remoteJid is not a valid direct WhatsApp JID', 400)
+      }
+      const requestedAlt = String(body?.remoteJidAlt ?? '').trim()
+      targets.push({
+        queryJid: requestedJid,
+        identity: resolveWhatsAppIdentity(
+          requestedJid,
+          isSupportedDirectJid(requestedAlt) ? requestedAlt : '',
+        ),
+      })
     } else {
       const chats = await evolutionFetch(`/chat/findChats/${encodeURIComponent(instanceName)}`, {
         method: 'POST',
@@ -58,44 +136,101 @@ Deno.serve(async (req: Request) => {
             ? (chats.data as any).chats
             : []
 
-      targetJids = rawChats
-        .map((chat: any) => String(chat?.remoteJid || chat?.jid || chat?.id || '').trim())
-        .filter(directJid)
-        .slice(0, 500)
+      const seen = new Set<string>()
+      for (const chat of rawChats) {
+        const primaryJid = firstWhatsAppJid(chat)
+        if (!primaryJid) {
+          rejectedInternalIds++
+          continue
+        }
+        const alternateJid = alternateWhatsAppJid(chat)
+        const identity = resolveWhatsAppIdentity(
+          primaryJid,
+          alternateJid,
+          chat?.number ?? chat?.phoneNumber ?? chat?.phone,
+        )
+        if (!identity.remoteJid || !isSupportedDirectJid(identity.remoteJid)) continue
+
+        const key = identity.phoneNumber || identity.lidJid || identity.remoteJid
+        if (seen.has(key)) continue
+        seen.add(key)
+        targets.push({
+          queryJid: primaryJid,
+          identity,
+          pushName: cleanPushName(chat?.pushName ?? chat?.name, identity),
+          profilePictureUrl:
+            chat?.profilePictureUrl ?? chat?.profilePicUrl ?? chat?.profilePicture ?? undefined,
+        })
+      }
     }
 
     const db = createServiceClient()
+    const { data: existingRows, error: existingError } = await db
+      .from('whatsapp_contacts')
+      .select('*')
+      .eq('user_id', tenantUserId)
+    if (existingError) return errorResponse(existingError.message, 500)
+
+    const byRemote = new Map<string, any>()
+    const byLid = new Map<string, any>()
+    const byPhone = new Map<string, any>()
+    for (const row of existingRows ?? []) {
+      if (row.remote_jid) byRemote.set(row.remote_jid, row)
+      if (row.lid_jid) byLid.set(row.lid_jid, row)
+      if (row.phone_number) byPhone.set(row.phone_number, row)
+    }
+
     let synced = 0
     let conversations = 0
+    let createdContacts = 0
     const errors: Array<{ remoteJid: string; error: string }> = []
 
-    for (const jid of targetJids) {
-      let { data: contact } = await db
-        .from('whatsapp_contacts')
-        .select('*')
-        .eq('user_id', tenantUserId)
-        .eq('remote_jid', jid)
-        .maybeSingle()
+    for (const target of targets) {
+      const identity = target.identity
+      let contact =
+        byRemote.get(identity.remoteJid) ||
+        (identity.lidJid ? byLid.get(identity.lidJid) || byRemote.get(identity.lidJid) : null) ||
+        (identity.phoneNumber ? byPhone.get(identity.phoneNumber) : null)
 
-      if (!contact) {
+      const contactPatch: Record<string, unknown> = {
+        user_id: tenantUserId,
+        remote_jid: identity.remoteJid,
+        lid_jid: identity.lidJid,
+        phone_number: identity.phoneNumber,
+      }
+      if (target.pushName !== undefined) contactPatch.push_name = target.pushName
+      if (target.profilePictureUrl !== undefined) {
+        contactPatch.profile_picture_url = target.profilePictureUrl || null
+      }
+
+      if (contact) {
+        const { error: updateError } = await db
+          .from('whatsapp_contacts')
+          .update(contactPatch)
+          .eq('id', contact.id)
+        if (updateError) {
+          errors.push({ remoteJid: target.queryJid, error: updateError.message })
+          continue
+        }
+        contact = { ...contact, ...contactPatch }
+      } else {
         const { data: created, error: createError } = await db
           .from('whatsapp_contacts')
-          .insert({
-            user_id: tenantUserId,
-            remote_jid: jid,
-            phone_number: digitsFromJid(jid) || null,
-            last_message_at: new Date().toISOString(),
-          })
+          .insert(contactPatch)
           .select()
           .single()
-
         if (createError) {
-          errors.push({ remoteJid: jid, error: createError.message })
+          errors.push({ remoteJid: target.queryJid, error: createError.message })
           continue
         }
         contact = created
+        createdContacts++
       }
+
       if (!contact) continue
+      byRemote.set(identity.remoteJid, contact)
+      if (identity.lidJid) byLid.set(identity.lidJid, contact)
+      if (identity.phoneNumber) byPhone.set(identity.phoneNumber, contact)
       conversations++
 
       const { data: msgData, error: msgError } = await evolutionFetch(
@@ -103,7 +238,7 @@ Deno.serve(async (req: Request) => {
         {
           method: 'POST',
           body: {
-            where: { key: { remoteJid: jid } },
+            where: { key: { remoteJid: target.queryJid } },
             limit,
             offset: 0,
           },
@@ -111,7 +246,7 @@ Deno.serve(async (req: Request) => {
       )
 
       if (msgError) {
-        errors.push({ remoteJid: jid, error: msgError })
+        errors.push({ remoteJid: target.queryJid, error: msgError })
         continue
       }
 
@@ -122,9 +257,7 @@ Deno.serve(async (req: Request) => {
         const messageId = msg?.key?.id
         if (!messageId) continue
 
-        const timestamp = msg?.messageTimestamp
-          ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
-          : new Date().toISOString()
+        const timestamp = messageTimestamp(msg)
         if (!latestTimestamp || timestamp > latestTimestamp) latestTimestamp = timestamp
 
         const { error: upsertError } = await db
@@ -143,20 +276,26 @@ Deno.serve(async (req: Request) => {
             { onConflict: 'user_id,message_id' },
           )
 
-        if (upsertError) errors.push({ remoteJid: jid, error: upsertError.message })
+        if (upsertError) errors.push({ remoteJid: target.queryJid, error: upsertError.message })
         else synced++
       }
 
       if (latestTimestamp) {
-        await db.from('whatsapp_contacts').update({ last_message_at: latestTimestamp }).eq('id', contact.id)
+        await db
+          .from('whatsapp_contacts')
+          .update({ last_message_at: latestTimestamp })
+          .eq('id', contact.id)
       }
     }
 
     return jsonResponse({
       success: errors.length === 0,
+      source: 'chats',
       synced,
       conversations,
-      total: targetJids.length,
+      createdContacts,
+      totalChats: targets.length,
+      rejectedInternalIds,
       errors: errors.slice(0, 20),
     })
   } catch (err) {
