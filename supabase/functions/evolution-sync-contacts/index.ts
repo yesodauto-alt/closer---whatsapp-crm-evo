@@ -75,7 +75,14 @@ Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
-    const { user, integration, tenantUserId } = await resolveIntegration(req)
+    const body = await req.json().catch(() => ({}))
+    const integrationId = String(body?.integrationId ?? '').trim() || null
+    const channelId = String(body?.channelId ?? '').trim() || null
+
+    const { user, integration, tenantUserId } = await resolveIntegration(req, {
+      integrationId,
+      channelId,
+    })
     if (!user || !integration || !tenantUserId) return errorResponse('Unauthorized', 401)
     if (!integration.instance_name) return errorResponse('Integration has no instance_name', 400)
 
@@ -101,7 +108,7 @@ Deno.serve(async (req: Request) => {
     const { data: existingRows, error: existingError } = await db
       .from('whatsapp_contacts')
       .select('id, remote_jid, lid_jid, phone_number, push_name')
-      .eq('user_id', tenantUserId)
+      .eq('integration_id', integration.id)
     if (existingError) return errorResponse(existingError.message, 500)
 
     const byRemote = new Map<string, any>()
@@ -149,6 +156,7 @@ Deno.serve(async (req: Request) => {
 
       const row: Record<string, unknown> = {
         user_id: tenantUserId,
+        integration_id: integration.id,
         remote_jid: identity.remoteJid,
         lid_jid: identity.lidJid,
         phone_number: identity.phoneNumber,
@@ -191,9 +199,19 @@ Deno.serve(async (req: Request) => {
       synced++
     }
 
+    const now = new Date().toISOString()
+    if (integration.channel_id) {
+      await db
+        .from('channels')
+        .update({ last_sync_at: now, updated_at: now })
+        .eq('id', integration.channel_id)
+    }
+
     return jsonResponse({
       success: errors.length === 0,
       source: 'chats',
+      integrationId: integration.id,
+      channelId: integration.channel_id,
       totalChats: chats.length,
       synced,
       created,
