@@ -1,0 +1,5 @@
+[functions.evolution-sync-contacts]
+verify_jwt = false
+
+[functions.evolution-sync-messages]
+verify_jwt = false
