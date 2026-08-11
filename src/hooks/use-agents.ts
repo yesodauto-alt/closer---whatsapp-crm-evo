@@ -55,6 +55,9 @@ export const useAgents = () => {
         restrictions: agent.restrictions,
         knowledge_base_enabled: agent.knowledge_base_enabled || false,
         team_id: agent.team_id,
+        triage_enabled: agent.triage_enabled || false,
+        triage_instructions: agent.triage_instructions,
+        triage_history_limit: agent.triage_history_limit || 40,
         is_active: agent.is_active,
       })
       .select()
@@ -88,6 +91,9 @@ export const useAgents = () => {
         restrictions: agent.restrictions,
         knowledge_base_enabled: agent.knowledge_base_enabled,
         team_id: agent.team_id,
+        triage_enabled: agent.triage_enabled,
+        triage_instructions: agent.triage_instructions,
+        triage_history_limit: agent.triage_history_limit,
         is_active: agent.is_active,
         updated_at: new Date().toISOString(),
       })
